@@ -123,6 +123,17 @@ class Database:
             ''')
             
             self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS premium_transactions (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT NOT NULL,
+                    days INTEGER NOT NULL,
+                    provider TEXT NOT NULL,
+                    provider_ref TEXT NOT NULL UNIQUE,
+                    created_at TEXT NOT NULL
+                )
+            ''')
+            
+            self.cursor.execute('''
                 CREATE TABLE IF NOT EXISTS stats_history (
                     history_id SERIAL PRIMARY KEY,
                     user_id BIGINT REFERENCES players(user_id),
@@ -140,11 +151,29 @@ class Database:
             ''')
             
             self.conn.commit()
+            self._migrate_players_profile_premium()
             logger.info("Tables created successfully")
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
             self.conn.rollback()
             raise
+    
+    def _migrate_players_profile_premium(self):
+        """Добавляет колонки профиля/премиума к существующей таблице players."""
+        try:
+            self.cursor.execute(
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS premium_until TEXT"
+            )
+            self.cursor.execute(
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS nickname_changed_at TEXT"
+            )
+            self.cursor.execute(
+                "ALTER TABLE players ADD COLUMN IF NOT EXISTS game_id_changed_at TEXT"
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Migration players premium columns failed: {e}")
+            self.conn.rollback()
     
     def create_indexes(self):
         try:
@@ -264,6 +293,24 @@ class Database:
             logger.error(f"Error checking game_id {game_id}: {e}")
             return True
 
+    def is_game_id_taken_by_other(self, game_id, exclude_user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "SELECT 1 FROM players WHERE game_id = %s AND user_id != %s",
+                (game_id, exclude_user_id),
+            )
+            return self.cursor.fetchone() is not None
+        except Exception as e:
+            logger.error(f"Error checking game_id taken by other {game_id}: {e}")
+            return True
+
+    @staticmethod
+    def is_valid_game_id_format(game_id):
+        if not game_id or not (2 <= len(game_id) <= 13):
+            return False
+        return bool(re.match(r"^[0-9A-Za-z]+$", game_id))
+
     def is_user_registered(self, user_id):
         try:
             self.ensure_connection()
@@ -277,8 +324,8 @@ class Database:
         if not re.match(r'^[a-zA-Z0-9_]{3,16}$', nickname):
             return False, "Никнейм должен содержать только английские буквы, цифры и подчеркивания (3-16 символов)"
         
-        if not game_id.isdigit() or not (2 <= len(game_id) <= 13):
-            return False, "Игровой ID должен содержать только цифры (от 2 до 13 символов)"
+        if not self.is_valid_game_id_format(game_id):
+            return False, "Игровой ID: 2–13 символов, только цифры и латинские буквы"
         
         if self.is_game_id_taken(game_id):
             return False, "Этот игровой ID уже занят"
@@ -311,7 +358,8 @@ class Database:
             self.ensure_connection()
             self.cursor.execute('''
                 SELECT p.user_id, p.username, p.nickname, p.game_id, p.registration_date,
-                       ps.rating, ps.matches_played, ps.kills, ps.deaths
+                       ps.rating, ps.matches_played, ps.kills, ps.deaths,
+                       p.nickname_changed_at, p.game_id_changed_at, p.premium_until
                 FROM players p
                 LEFT JOIN player_stats ps ON p.user_id = ps.user_id
                 WHERE p.user_id = %s
@@ -320,6 +368,168 @@ class Database:
         except Exception as e:
             logger.error(f"Error getting player profile for {user_id}: {e}")
             return None
+
+    def is_premium(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT premium_until FROM players WHERE user_id = %s", (user_id,))
+            row = self.cursor.fetchone()
+            if not row or not row[0]:
+                return False
+            until = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            return datetime.now() < until
+        except Exception as e:
+            logger.error(f"Error checking premium for {user_id}: {e}")
+            return False
+
+    def get_premium_days_left(self, user_id):
+        """Сколько дней премиума осталось (0 если неактивен)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT premium_until FROM players WHERE user_id = %s", (user_id,))
+            row = self.cursor.fetchone()
+            if not row or not row[0]:
+                return 0
+            until = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            now = datetime.now()
+            if until <= now:
+                return 0
+            seconds_left = (until - now).total_seconds()
+            return max(1, int((seconds_left + 86399) // 86400))
+        except Exception as e:
+            logger.error(f"Error getting premium days left for {user_id}: {e}")
+            return 0
+
+    def profile_nickname_cooldown_remaining(self, user_id):
+        if self.is_premium(user_id):
+            return 0
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "SELECT nickname_changed_at FROM players WHERE user_id = %s", (user_id,)
+            )
+            row = self.cursor.fetchone()
+            if not row or not row[0]:
+                return 0
+            last = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            elapsed = (datetime.now() - last).total_seconds()
+            return max(0, int(24 * 3600 - elapsed))
+        except Exception as e:
+            logger.error(f"profile_nickname_cooldown_remaining {user_id}: {e}")
+            return 0
+
+    def profile_game_id_cooldown_remaining(self, user_id):
+        if self.is_premium(user_id):
+            return 0
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "SELECT game_id_changed_at FROM players WHERE user_id = %s", (user_id,)
+            )
+            row = self.cursor.fetchone()
+            if not row or not row[0]:
+                return 0
+            last = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+            elapsed = (datetime.now() - last).total_seconds()
+            return max(0, int(24 * 3600 - elapsed))
+        except Exception as e:
+            logger.error(f"profile_game_id_cooldown_remaining {user_id}: {e}")
+            return 0
+
+    def update_player_nickname_if_allowed(self, user_id, nickname):
+        if not re.match(r"^[a-zA-Z0-9_]{3,16}$", nickname):
+            return False, "Никнейм должен содержать только английские буквы, цифры и подчеркивания (3-16 символов)"
+        rem = self.profile_nickname_cooldown_remaining(user_id)
+        if rem > 0:
+            h, m = rem // 3600, (rem % 3600) // 60
+            return False, f"Смена никнейма доступна через {h}ч {m}м"
+        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE players SET nickname = %s, nickname_changed_at = %s WHERE user_id = %s",
+                (nickname, now_s, user_id),
+            )
+            self.conn.commit()
+            return True, "OK"
+        except Exception as e:
+            logger.error(f"update_player_nickname {user_id}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных"
+
+    def update_player_game_id_if_allowed(self, user_id, game_id):
+        if not self.is_valid_game_id_format(game_id):
+            return False, "Игровой ID: 2–13 символов, только цифры и латинские буквы"
+        if self.is_game_id_taken_by_other(game_id, user_id):
+            return False, "Этот игровой ID уже занят"
+        rem = self.profile_game_id_cooldown_remaining(user_id)
+        if rem > 0:
+            h, m = rem // 3600, (rem % 3600) // 60
+            return False, f"Смена игрового ID доступна через {h}ч {m}м"
+        now_s = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE players SET game_id = %s, game_id_changed_at = %s WHERE user_id = %s",
+                (game_id, now_s, user_id),
+            )
+            self.conn.commit()
+            return True, "OK"
+        except Exception as e:
+            logger.error(f"update_player_game_id {user_id}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных"
+
+    def try_register_premium_payment(self, user_id, days, provider, provider_ref):
+        """Идемпотентная выдача премиума и +100 рейтинга за покупку."""
+        if not self.is_user_registered(user_id):
+            logger.warning(f"Premium purchase for unregistered user {user_id} ignored")
+            return False
+        created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO premium_transactions (user_id, days, provider, provider_ref, created_at)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (provider_ref) DO NOTHING
+                   RETURNING id""",
+                (user_id, days, provider, provider_ref, created_at),
+            )
+            if self.cursor.fetchone() is None:
+                self.conn.commit()
+                return False
+
+            now = datetime.now()
+            self.cursor.execute(
+                "SELECT premium_until FROM players WHERE user_id = %s", (user_id,)
+            )
+            row = self.cursor.fetchone()
+            current_until = None
+            if row and row[0]:
+                try:
+                    current_until = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    pass
+            base = now
+            if current_until and current_until > now:
+                base = current_until
+            new_until = base + timedelta(days=days)
+            new_s = new_until.strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                "UPDATE players SET premium_until = %s WHERE user_id = %s",
+                (new_s, user_id),
+            )
+            self.cursor.execute(
+                "UPDATE player_stats SET rating = rating + 100 WHERE user_id = %s",
+                (user_id,),
+            )
+            self.conn.commit()
+            logger.info(f"Premium {days}d for user {user_id} via {provider}")
+            return True
+        except Exception as e:
+            logger.error(f"try_register_premium_payment: {e}")
+            self.conn.rollback()
+            return False
     
     def get_player_by_id(self, user_id):
         try:
@@ -775,7 +985,11 @@ class Database:
                 
             current_rating, current_matches, current_kills, current_deaths = current_stats
             
-            rating_to_add = kills + 1
+            base_rating = kills + 1
+            if self.is_premium(user_id):
+                rating_to_add = int(round(base_rating * 1.5))
+            else:
+                rating_to_add = base_rating
             new_rating = current_rating + rating_to_add
             new_matches = current_matches + 1
             new_kills = current_kills + kills
