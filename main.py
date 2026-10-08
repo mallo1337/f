@@ -1748,7 +1748,7 @@ async def process_screenshot(message: types.Message, state: FSMContext):
             user_id,
             "✅ Скриншот отправлен на модерацию!\n\n"
             "📊 После проверки статистика будет автоматически обновлена.\n\n"
-            "По вопросам к @bosin1337",
+            "По вопросам к @uglymatthey",
             None,
             get_back_keyboard()
         )
