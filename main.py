@@ -1253,8 +1253,8 @@ async def process_lobby_players(message: types.Message, state: FSMContext):
     try:
         max_players = int(message.text.strip())
         
-        if max_players < 3 or max_players > 10:
-            await message.answer("❌ Введите число от 3 до 10")
+        if max_players < 2 or max_players > 10:
+            await message.answer("❌ Введите число от 2 до 10")
             return
         
         await state.update_data(max_players=max_players)
