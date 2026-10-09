@@ -45,6 +45,15 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from database import Database
+import html
+
+def esc(value):
+    """Экранирование текста от пользователя для сообщений с parse_mode='HTML'."""
+    return html.escape(str(value), quote=False) if value is not None else ""
+
+def prepare_markdown_v2(text):
+    """Экранирует служебные символы MarkdownV2 (. ! - = и т.д.), оставляя * _ ` [ ] ( ) для форматирования."""
+    return re.sub(r'(?<!\\)([~>#+\-=|{}.!])', r'\\\1', text)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,6 +87,39 @@ PREMIUM_STARS_90 = 140
 
 # Ожидающие счета CryptoBot: user_id -> {"invoice_id": int, "days": int}
 pending_cryptobot_invoices = {}
+
+# ---- PREMIUM EMOJI ----
+# Формат: ключ -> (emoji_id или None, fallback-эмодзи)
+# Чтобы добавить новый — просто впишите ID, код менять не нужно.
+# Использование в тексте: f"{pe('wave')} Привет"
+PREMIUM_EMOJI = {
+    "wave":       ("5440431182602842059", "👋"),
+    "profile":    ("5190892530438260422", "👤"),
+    "trophy":     ("5409008750893734809", "🏆"),
+    # ⬇️ Добавляйте сюда остальные по мере получения ID:
+    # "premium":  (None, "⭐️"),
+    # "gamepad":  (None, "🎮"),
+    # "pencil":   (None, "✏️"),
+    # "camera":   (None, "📸"),
+    # "check":    (None, "✅"),
+    # "cross":    (None, "❌"),
+    # "refresh":  (None, "🔄"),
+    # "chart":    (None, "📈"),
+    # "id":       (None, "🆔"),
+    # "fire":     (None, "🔥"),
+}
+
+def pe(key: str) -> str:
+    """Премиум-эмодзи для текстов сообщений (HTML).
+    Если ID не задан — возвращает обычный fallback-эмодзи."""
+    entry = PREMIUM_EMOJI.get(key)
+    if not entry:
+        return key
+    eid, fb = entry
+    if not eid:
+        return fb
+    return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
+# ---- END PREMIUM EMOJI ----
 
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env файле")
@@ -227,8 +269,6 @@ def get_screenshot_cancel_keyboard():
 
 def get_top_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🏆 Еженедельный топ", callback_data="top_weekly")],
-        [InlineKeyboardButton(text="⭐ Постоянный топ", callback_data="top_all_time")],
         [InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_main")]
     ])
 
@@ -318,7 +358,7 @@ def premium_until_human(premium_until_str):
 def post_purchase_menu_caption(first_name: str, days: int) -> str:
     return (
         f"Благодарим за покупку! Вам выдан Premium на {days} дней.\n\n"
-        f"\U0001f44b Привет, {first_name}!\n\nВыберите действие:"
+        f"{pe('wave')} Привет, {esc(first_name)}!\n\nВыберите действие:"
     )
 
 
@@ -391,14 +431,13 @@ def cryptobot_api_call(method: str, params=None):
         return None, data.get("error", {}).get("name", str(data))
     return data.get("result"), None
 
-def cryptobot_invoice_is_paid(invoice_id: int):
-    """Проверка статуса счёта CryptoBot (True если оплачен)."""
-    # В API параметр invoice_ids — строка id через запятую
+def cryptobot_get_invoice(invoice_id: int):
+    """Возвращает (счёт, ошибка) из CryptoBot."""
     result, err = cryptobot_api_call(
         "getInvoices", {"invoice_ids": str(invoice_id), "count": 100}
     )
     if err:
-        return False, err
+        return None, err
     items = []
     if isinstance(result, dict):
         items = result.get("items") or result.get("invoices") or []
@@ -407,8 +446,15 @@ def cryptobot_invoice_is_paid(invoice_id: int):
     for inv in items:
         iid = inv.get("invoice_id")
         if iid is not None and int(iid) == int(invoice_id):
-            return inv.get("status") == "paid", None
-    return False, "Счёт не найден в ответе API"
+            return inv, None
+    return None, "Счёт не найден в ответе API"
+
+def cryptobot_invoice_is_paid(invoice_id: int):
+    """Проверка статуса счёта CryptoBot (True если оплачен)."""
+    inv, err = cryptobot_get_invoice(invoice_id)
+    if err:
+        return False, err
+    return inv.get("status") == "paid", None
 
 async def finalize_premium_purchase(user_id: int, days: int, provider: str, provider_ref: str):
     """Выдача премиума после оплаты и лог в чат модерации."""
@@ -659,7 +705,7 @@ async def create_lobby_forum_topic(lobby_unique_id, lobby_info, players):
             f"📥 Новое лобби #{lobby_unique_id}\n\n"
             f"🗺 Карта: {map_name}\n"
             f"🎮 Режим: {mode}\n"
-            f"👤 Хостер: {creator_tg_name}\n\n"
+            f"👤 Хостер: {esc(creator_tg_name)}\n\n"
             f"Игроки:\n"
         )
         
@@ -770,7 +816,7 @@ def format_lobby_info(lobby_info, players, creator_first_name=None):
         
         mode_weapons = MODES.get(mode, {}).get('weapons', 'Доступны все оружия!')
         
-        creator_display = creator_first_name if creator_first_name else "Неизвестно"
+        creator_display = esc(creator_first_name) if creator_first_name else "Неизвестно"
         if is_admin(creator_id):
             creator_display = f"{creator_display} ✅"
         
@@ -891,18 +937,18 @@ async def cmd_start(message: types.Message):
     if len(args) > 1 and args[1] == "join_lobby":
         if db.is_user_registered(user_id):
             await send_message_with_image(message.chat.id, 
-                                        "🎮 Добро пожаловать! Вы перешли по ссылке присоединения к лобби.\n\nВыберите действие:", 
+                                        f"🎮 Добро пожаловать! Вы перешли по ссылке присоединения к лобби.\n\nВыберите действие:", 
                                         MENU_IMAGE_URL, 
                                         get_main_keyboard(user_id))
         else:
             await message.answer(
-                f"👋 Привет, {first_name}!\n\nДля участия в лобби нужно зарегистрироваться:", 
+                f"{pe('wave')} Привет, {first_name}!\n\nДля участия в лобби нужно зарегистрироваться:", 
                 reply_markup=get_registration_keyboard()
             )
         return
     
     if db.is_user_registered(user_id):
-        menu_text = f"👋 Привет, {first_name}!\n\nВыберите действие:"
+        menu_text = f"{pe('wave')} Привет, {esc(first_name)}!\n\nВыберите действие:"
         await send_message_with_image(
             message.chat.id, 
             menu_text, 
@@ -911,7 +957,7 @@ async def cmd_start(message: types.Message):
         )
     else:
         start_message = await message.answer(
-            f"👋 Привет, {first_name}!\n\nНажмите чтобы зарегистрироваться:", 
+            f"{pe('wave')} Привет, {first_name}!\n\nНажмите чтобы зарегистрироваться:", 
             reply_markup=get_registration_keyboard()
         )
         user_menu_messages.put(user_id, start_message.message_id)
@@ -1107,7 +1153,7 @@ async def cmd_post(message: types.Message, state: FSMContext):
         )
         return
     
-    broadcast_text = args[1]
+    broadcast_text = prepare_markdown_v2(args[1])
     
     await state.update_data(broadcast_text=broadcast_text)
     
@@ -1829,7 +1875,7 @@ async def process_game_id(message: types.Message, state: FSMContext):
         await cleanup_user_messages(user_id)
         
         await state.clear()
-        menu_text = f"✅ Регистрация завершена!\n\n👋 Добро пожаловать, {nickname}!\n\nВыберите действие:"
+        menu_text = f"✅ Регистрация завершена!\n\n{pe('wave')} Добро пожаловать, {nickname}!\n\nВыберите действие:"
         await send_message_with_image(message.chat.id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
     else:
         await message.answer(f"❌ {message_text}")
@@ -1843,12 +1889,12 @@ async def cancel_registration(callback_query: types.CallbackQuery, state: FSMCon
     await cleanup_user_messages(user_id)
     
     if db.is_user_registered(user_id):
-        menu_text = f"👋 Привет, {first_name}!\n\nВыберите действие:"
+        menu_text = f"{pe('wave')} Привет, {esc(first_name)}!\n\nВыберите действие:"
         await send_message_with_image(user_id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
     else:
         await send_message_with_image(
             user_id,
-            f"👋 Привет, {first_name}!\n\nНажмите чтобы зарегистрироваться:",
+            f"{pe('wave')} Привет, {esc(first_name)}!\n\nНажмите чтобы зарегистрироваться:",
             None,
             get_registration_keyboard()
         )
@@ -2095,51 +2141,7 @@ async def show_next_lobby_history(callback_query: types.CallbackQuery):
         await callback_query.answer("❌ Ошибка при загрузке истории", show_alert=True)
     await callback_query.answer()
 
-@dp.callback_query(lambda c: c.data == "top")
-async def show_top_menu(callback_query: types.CallbackQuery):
-    top_menu_text = "🏆 Выберите тип топа:"
-    await cleanup_user_messages(callback_query.from_user.id)
-    await send_message_with_image(callback_query.from_user.id, top_menu_text, TOP_IMAGE_URL, get_top_keyboard())
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "top_weekly")
-async def show_weekly_top(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    
-    top_players = db.get_weekly_top_players()
-    
-    top_text = "🏆 Еженедельный топ (топ-10):\n\n"
-    
-    if not top_players:
-        top_text += "❌ Пока нет игроков с статистикой\n\n"
-    else:
-        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
-        
-        for i, player_data in enumerate(top_players):
-            user_id_player, nickname, rating, kills, deaths, matches = player_data
-            
-            kd_ratio = kills / deaths if deaths > 0 else kills
-            level = get_player_level(rating)
-            
-            medal = medals[i] if i < len(medals) else f"{i+1}."
-            
-            nick_disp = display_nickname(user_id_player, nickname)
-            top_text += f"{medal} {nick_disp} | {level}\n🏆 {rating} | K/D: {kd_ratio:.2f} | 🎮 {matches}\n\n"
-    
-    player_position = db.get_player_weekly_position(user_id)
-    
-    if player_position > 0:
-        top_text += f"🎯 Ваша позиция: {player_position}\n\n"
-    else:
-        top_text += "⚠️ Вас нет в этом топе\n\n"
-    
-    top_text += "💰 Призовой фонд: 5.000 голды\n🔄 Обновляется каждый понедельник"
-    
-    await cleanup_user_messages(user_id)
-    await send_message_with_image(user_id, top_text, TOP_IMAGE_URL, get_top_keyboard())
-    await callback_query.answer()
-
-@dp.callback_query(lambda c: c.data == "top_all_time")
+@dp.callback_query(lambda c: c.data in ("top", "top_all_time"))
 async def show_all_time_top(callback_query: types.CallbackQuery):
     top_players = db.get_all_time_top_players()
     user_id = callback_query.from_user.id
@@ -2147,12 +2149,13 @@ async def show_all_time_top(callback_query: types.CallbackQuery):
     has_any_stats = db.get_player_has_any_stats(user_id)
     
     if not top_players:
-        top_text = "🏆 Топ игроков:\n\n❌ Пока нет данных"
+        top_text = f"{pe('trophy')} Топ игроков:\n\n❌ Пока нет данных"
         await cleanup_user_messages(user_id)
         await send_message_with_image(user_id, top_text, TOP_IMAGE_URL, get_top_keyboard())
+        await callback_query.answer()
         return
     
-    top_text = "🏆 Топ игроков за все время:\n\n"
+    top_text = f"{pe('trophy')} Топ игроков за все время:\n\n"
     
     for i, player_data in enumerate(top_players):
         user_id_player, nickname, rating, matches_played, kills, deaths = player_data
@@ -2256,7 +2259,7 @@ async def premium_pay_crypto(callback_query: types.CallbackQuery):
             [
                 InlineKeyboardButton(
                     text="🔍 Проверить оплату",
-                    callback_data=f"premium_cbcheck:{invoice_id}:{uid}",
+                    callback_data=f"premium_cbcheck:{invoice_id}:{uid}:{days}",
                 )
             ],
             [InlineKeyboardButton(text="◀️ Назад", callback_data=f"premium_pick_back_{days}")],
@@ -2299,29 +2302,46 @@ async def premium_pick_back(callback_query: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("premium_cbcheck:"))
 async def premium_cryptobot_check(callback_query: types.CallbackQuery):
     parts = callback_query.data.split(":")
-    if len(parts) != 3:
+    if len(parts) not in (3, 4):
         await callback_query.answer()
         return
     try:
         invoice_id = int(parts[1])
         owner_id = int(parts[2])
+        days = int(parts[3]) if len(parts) == 4 else None
     except ValueError:
         await callback_query.answer()
         return
     if callback_query.from_user.id != owner_id:
         await callback_query.answer("Это не ваш счёт.", show_alert=True)
         return
-    pend = pending_cryptobot_invoices.get(owner_id)
-    if not pend or int(pend["invoice_id"]) != invoice_id:
-        await callback_query.answer("Создайте новый счёт из меню Premium.", show_alert=True)
+    if days is None:
+        # Старые кнопки (до обновления): срок берём из памяти бота
+        pend = pending_cryptobot_invoices.get(owner_id)
+        if not pend or int(pend["invoice_id"]) != invoice_id:
+            await callback_query.answer("Создайте новый счёт из меню Premium.", show_alert=True)
+            return
+        days = pend["days"]
+    if days not in (PREMIUM_30_DAYS, PREMIUM_90_DAYS):
+        await callback_query.answer()
         return
-    days = pend["days"]
-    paid, err = await asyncio.to_thread(cryptobot_invoice_is_paid, invoice_id)
-    if err and not paid:
-        await callback_query.answer(f"Ошибка: {err}", show_alert=True)
+    inv, err = await asyncio.to_thread(cryptobot_get_invoice, invoice_id)
+    if err or not inv:
+        await callback_query.answer(f"Ошибка: {err or 'счёт не найден'}", show_alert=True)
         return
-    if not paid:
+    if inv.get("status") != "paid":
         await callback_query.answer("Оплата ещё не поступила.", show_alert=True)
+        return
+    expected_usd = PREMIUM_PRICE_USD_30 if days == PREMIUM_30_DAYS else PREMIUM_PRICE_USD_90
+    try:
+        amount_ok = abs(float(inv.get("amount")) - float(expected_usd)) < 0.001
+        if inv.get("currency_type") == "fiat" and inv.get("fiat") != "USD":
+            amount_ok = False
+    except (TypeError, ValueError):
+        amount_ok = False
+    if not amount_ok:
+        logger.warning(f"CryptoBot invoice {invoice_id}: amount mismatch for {days} days: {inv.get('amount')} {inv.get('fiat')}")
+        await callback_query.answer("Сумма счёта не совпадает с выбранным тарифом.", show_alert=True)
         return
     ref = f"cryptobot_{invoice_id}"
     ok = await finalize_premium_purchase(owner_id, days, "cryptobot", ref)
@@ -2403,7 +2423,24 @@ async def on_successful_payment(message: types.Message):
     ref = f"stars_{sp.telegram_payment_charge_id}"
     ok = await finalize_premium_purchase(uid, days, "telegram_stars", ref)
     if not ok:
-        await message.answer("Не удалось активировать Premium (возможно, платёж уже учтён).")
+        try:
+            if PREMIUM_LOG_CHAT_ID:
+                await bot.send_message(
+                    chat_id=int(PREMIUM_LOG_CHAT_ID),
+                    text=(
+                        "⚠️ Платёж Stars не активирован автоматически.\n"
+                        f"user_id: {uid}\n"
+                        f"Дней: {days}\n"
+                        f"charge_id: {sp.telegram_payment_charge_id}\n"
+                        "Возможно, это повтор уже учтённого платежа — проверьте вручную."
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"stars failure log: {e}")
+        await message.answer(
+            "Не удалось активировать Premium (возможно, платёж уже учтён). "
+            "Если Premium не появился, напишите администратору."
+        )
         return
     try:
         await message.delete()
@@ -2550,7 +2587,7 @@ async def back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
     await cleanup_user_messages(user_id)
     await cleanup_lobby_messages(user_id)
     
-    menu_text = f"👋 Привет, {first_name}!\n\nВыберите действие:"
+    menu_text = f"{pe('wave')} Привет, {esc(first_name)}!\n\nВыберите действие:"
     await send_message_with_image(user_id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
     await callback_query.answer()
 
