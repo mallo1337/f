@@ -90,8 +90,9 @@ pending_cryptobot_invoices = {}
 
 # ---- PREMIUM EMOJI ----
 # Формат: ключ -> (emoji_id или None, fallback-эмодзи)
-# Чтобы добавить новый — просто впишите ID, код менять не нужно.
-# Использование в тексте: f"{pe('wave')} Привет"
+# pe(key)       — для текстов сообщений, возвращает <tg-emoji> тег
+# pe_icon(key)  — для инлайн-кнопок, возвращает emoji_id (icon_custom_emoji_id)
+# Чтобы добавить новый — впишите ID в словарь и используйте pe/pe_icon в коде.
 PREMIUM_EMOJI = {
     "wave":       ("5440431182602842059", "👋"),
     "profile":    ("5190892530438260422", "👤"),
@@ -119,6 +120,13 @@ def pe(key: str) -> str:
     if not eid:
         return fb
     return f'<tg-emoji emoji-id="{eid}">{fb}</tg-emoji>'
+
+def pe_icon(key: str):
+    """Emoji ID для инлайн-кнопки (icon_custom_emoji_id) или None."""
+    entry = PREMIUM_EMOJI.get(key)
+    if not entry or not entry[0]:
+        return None
+    return entry[0]
 # ---- END PREMIUM EMOJI ----
 
 if not BOT_TOKEN:
@@ -238,18 +246,42 @@ def get_registration_keyboard():
     ]])
 
 def get_main_keyboard(user_id=None):
+    """Главное меню с премиум-иконками на кнопках."""
+    profile_btn = InlineKeyboardButton(
+        text="Мой профиль",
+        callback_data="profile",
+    )
+    if pe_icon("profile"):
+        profile_btn = InlineKeyboardButton(
+            text="Мой профиль",
+            callback_data="profile",
+            icon_custom_emoji_id=pe_icon("profile"),
+        )
+
+    premium_btn = InlineKeyboardButton(
+        text="Premium",
+        callback_data="premium_menu",
+    )
+    top_btn = InlineKeyboardButton(
+        text="Топ игроков",
+        callback_data="top",
+    )
+    if pe_icon("trophy"):
+        top_btn = InlineKeyboardButton(
+            text="Топ игроков",
+            callback_data="top",
+            icon_custom_emoji_id=pe_icon("trophy"),
+        )
+
     keyboard = [
-        [InlineKeyboardButton(text="👤 Мой профиль", callback_data="profile")],
-        [
-            InlineKeyboardButton(text="⭐️ Premium", callback_data="premium_menu"),
-            InlineKeyboardButton(text="🏆 Топ игроков", callback_data="top"),
-        ],
+        [profile_btn],
+        [premium_btn, top_btn],
         [InlineKeyboardButton(text="🎮 Активные лобби", callback_data="active_lobbies")],
     ]
-    
+
     if user_id and is_admin(user_id):
         keyboard.append([InlineKeyboardButton(text="➕ Создать лобби", callback_data="create_lobby")])
-    
+
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def get_back_keyboard():
@@ -1003,7 +1035,7 @@ async def show_profile_from_message(message: types.Message):
         prem_line = f"\n⭐️ Премиум: {days_left} дней\n"
     
     profile_text = (
-        f"👤 Ваш профиль | {username_display}\n\n"
+        f"{pe('profile')} Ваш профиль | {username_display}\n\n"
         f"🆔 <code>{game_id}</code>\n"
         f"📈 Уровень: {level}\n"
         f"🏆 Рейтинг: {rating}{prem_line}\n"
@@ -1938,7 +1970,7 @@ async def show_profile(callback_query: types.CallbackQuery):
         prem_line = f"\n⭐️ Премиум: {days_left} дней\n"
     
     profile_text = (
-        f"👤 Ваш профиль | {username_display}\n\n"
+        f"{pe('profile')} Ваш профиль | {username_display}\n\n"
         f"🆔 <code>{game_id}</code>\n"
         f"📈 Уровень: {level}\n"
         f"🏆 Рейтинг: {rating}{prem_line}\n"
