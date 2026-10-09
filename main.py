@@ -78,10 +78,10 @@ CRYPTOBOT_USE_TESTNET = os.getenv('CRYPTOBOT_USE_TESTNET', 'true').lower() in ('
 
 PREMIUM_30_DAYS = 30
 PREMIUM_90_DAYS = 90
-PREMIUM_PRICE_USD_30 = '1.32'
-PREMIUM_PRICE_USD_90 = '2.64'
-PREMIUM_STARS_30 = 70
-PREMIUM_STARS_90 = 140
+PREMIUM_PRICE_USD_30 = '1.01'
+PREMIUM_PRICE_USD_90 = '2.02'
+PREMIUM_STARS_30 = 29
+PREMIUM_STARS_90 = 49
 
 pending_cryptobot_invoices = {}
 
@@ -98,6 +98,7 @@ PREMIUM_EMOJI = {
     "✅": ("5429501538806548545", "✅"),
     "❌": ("5210952531676504517", "❌"),
     "🗑": ("5445267414562389170", "🗑"),
+    "✔": ("5780463361175066565", "✔"),
     "🚪": ("5452029295109086676", "🚪"),
     "📸": ("5235837920081887219", "📸"),
     "📝": ("5334882760735598374", "📝"),
@@ -403,7 +404,7 @@ def display_nickname(user_id, nickname):
     name = nickname or ""
     parts = [name]
     if is_admin(user_id):
-        parts.append(pe("✅"))
+        parts.append(pe("✔"))       
     if db.is_premium(user_id):
         parts.append(pe("⭐️"))
     if len(parts) == 1:
@@ -531,7 +532,7 @@ async def finalize_premium_purchase(user_id: int, days: int, provider: str, prov
             f"{line_user}\n"
             f"Купил премиум на {days} дней!\n"
             f"Не забудьте выдать покупателю доступ в приватный чат и префикс в чате!\n"
-            f"@bosin1337, @blesswayknow"
+            f"@uglymatthey"
         )
         if PREMIUM_LOG_CHAT_ID:
             await bot.send_message(chat_id=int(PREMIUM_LOG_CHAT_ID), text=log_text)
