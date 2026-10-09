@@ -233,17 +233,17 @@ user_lobby_messages = LRUCache(1000)
 user_menu_messages = LRUCache(1000)
 
 MODES = {
-    'Pistol DM': {'key': 'pistol_dm', 'weapons': 'G22, USP, P350, TEC-9, F/S, Desert Eagle'},
-    'Rifle DM': {'key': 'rifle_dm', 'weapons': 'FN FAL, FAMAS, M4, AKR, AKR12, M16'},
+    'Pistol DM': {'key': 'pistol_dm', 'weapons': 'G22, USP, P350, TEC-9, F/S, Desert Eagle, Berretas'},
+    'Rifle DM': {'key': 'rifle_dm', 'weapons': 'FN FAL, FAMAS, M4, M4A1, AKR, AKR12, M16'},
     'Sniper DM': {'key': 'sniper_dm', 'weapons': 'M40, M110, AWM'},
-    'SMGs DM': {'key': 'smgs_dm', 'weapons': 'UMP45, MP5, MP7, P90'},
+    'SMGs DM': {'key': 'smgs_dm', 'weapons': 'UMP45, MP5, MP7, P90, МАС10'},
     'Allguns DM': {'key': 'allguns dm', 'weapons': 'ДОСТУПНЫ ВСЕ ОРУЖИЯ'}
 }
 
-MAPS = ['🏜 SandStone', '🏘 Province', '🧱 Rust', '🏭 Zone 9']
-TIMES = ['10 минут']
-DAMAGE_TYPES = ['по всему телу']
-REGIONS = ['Россия']
+MAPS = ['🏜 SandStone', '🏘 Province', '🧱 Rust', '🏭 Zone 9', '🏝️ Breeze', '🌸 Sakura']
+TIMES = ['3 минуты', '5 минут', '10 минут']
+DAMAGE_TYPES = ['По всему телу', 'Только в голову']
+REGIONS = ['Москва', 'Германия']
 
 def load_admins():
     try:
