@@ -73,8 +73,6 @@ SCREENSHOT_IMAGE_URL = os.getenv('SCREENSHOT_IMAGE_URL')
 LOBBY_IMAGE_URL = os.getenv('LOBBY_IMAGE_URL', 'https://example.com/lobby.jpg')
 PREMIUM_IMAGE_URL = os.getenv('PREMIUM_IMAGE_URL')
 PREMIUM_LOG_CHAT_ID = os.getenv('PREMIUM_LOG_CHAT_ID') or MODERATOR_GROUP_ID
-# Токен и API должны совпадать: testnet → токен из @CryptoTestnetBot + testnet-pay.crypt.bot;
-# продакшен → токен из @CryptoBot + pay.crypt.bot (CRYPTOBOT_USE_TESTNET=false).
 CRYPTOBOT_TOKEN = os.getenv("CRYPTOBOT_TOKEN", "").strip().strip('"').strip("'")
 CRYPTOBOT_USE_TESTNET = os.getenv('CRYPTOBOT_USE_TESTNET', 'true').lower() in ('1', 'true', 'yes')
 
@@ -85,12 +83,10 @@ PREMIUM_PRICE_USD_90 = '2.64'
 PREMIUM_STARS_30 = 70
 PREMIUM_STARS_90 = 140
 
-# Ожидающие счета CryptoBot: user_id -> {"invoice_id": int, "days": int}
 pending_cryptobot_invoices = {}
 
 # ---- PREMIUM EMOJI ----
 # Ключ = сам эмодзи (fallback), значение = (emoji_id, fallback).
-# Благодаря этому pe('🎮') работает напрямую с эмодзи.
 PREMIUM_EMOJI = {
     "◀️": ("5256247952564825322", "◀️"),
     "⬅️": ("5465332604121140251", "⬅️"),
@@ -167,18 +163,34 @@ def pe_icon(emoji: str):
 
 def btn(text: str, callback_data: str = None, url: str = None, icon: str = None):
     """Хелпер для InlineKeyboardButton с премиум-иконкой.
-    В тексте кнопки эмодзи заменяются на премиум автоматически,
-    если для них есть ID."""
+
+    Важно: если задан icon и для него есть премиум-ID, то ведущий эмодзи
+    в тексте кнопки убирается — иначе Telegram нарисует и иконку, и
+    обычный эмодзи, получится дубликат.
+    """
     kwargs = {}
     if callback_data is not None:
         kwargs["callback_data"] = callback_data
     if url is not None:
         kwargs["url"] = url
+
+    clean_text = text
     if icon:
         eid = pe_icon(icon)
         if eid:
             kwargs["icon_custom_emoji_id"] = eid
-    return InlineKeyboardButton(text=text, **kwargs)
+            # Убираем ведущий эмодзи (и пробел после него), если он совпадает с иконкой.
+            # Учитываем, что у некоторых эмодзи есть variation selector (️).
+            if clean_text.startswith(icon):
+                clean_text = clean_text[len(icon):].lstrip()
+            else:
+                for suffix in ("️", ""):
+                    pref = icon + suffix
+                    if clean_text.startswith(pref):
+                        clean_text = clean_text[len(pref):].lstrip()
+                        break
+
+    return InlineKeyboardButton(text=clean_text, **kwargs)
 # ---- END PREMIUM EMOJI ----
 
 if not BOT_TOKEN:
@@ -189,7 +201,6 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 db = Database()
 
-# Используем LRU-кэш для управления памятью
 from collections import OrderedDict
 
 class LRUCache:
@@ -386,11 +397,9 @@ def get_lobby_history_keyboard(user_id, current_offset=0, has_next=False, total_
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def is_valid_game_id(game_id):
-    """Игровой ID: 2–13 символов, только цифры и латинские буквы."""
     return Database.is_valid_game_id_format(game_id)
 
 def display_nickname(user_id, nickname):
-    """Никнейм с отметками админа (✅) и Premium (⭐️) — с премиум-эмодзи."""
     name = nickname or ""
     parts = [name]
     if is_admin(user_id):
@@ -419,14 +428,12 @@ def post_purchase_menu_caption(first_name: str, days: int) -> str:
 
 
 async def show_post_purchase_main_menu(chat_id: int, user_id: int, first_name: str, days: int):
-    """Главное меню с картинкой после успешной оплаты Premium."""
     caption = post_purchase_menu_caption(first_name or "друг", days)
     await cleanup_user_messages(user_id)
     await send_message_with_image(chat_id, caption, MENU_IMAGE_URL, get_main_keyboard(user_id))
 
 
 def _cryptobot_flatten_params(params):
-    """Crypto Pay ожидает плоские query-параметры (как в официальных клиентах), не JSON POST."""
     if not params:
         return {}
     out = {}
@@ -443,7 +450,6 @@ def _cryptobot_flatten_params(params):
 
 
 def cryptobot_api_call(method: str, params=None):
-    """Синхронный вызов Crypto Pay API: GET + query (как go-cryptopay), не POST JSON."""
     if not CRYPTOBOT_TOKEN:
         return None, "CRYPTOBOT_TOKEN не задан в .env"
     base = (
@@ -487,7 +493,6 @@ def cryptobot_api_call(method: str, params=None):
     return data.get("result"), None
 
 def cryptobot_get_invoice(invoice_id: int):
-    """Возвращает (счёт, ошибка) из CryptoBot."""
     result, err = cryptobot_api_call(
         "getInvoices", {"invoice_ids": str(invoice_id), "count": 100}
     )
@@ -505,14 +510,12 @@ def cryptobot_get_invoice(invoice_id: int):
     return None, "Счёт не найден в ответе API"
 
 def cryptobot_invoice_is_paid(invoice_id: int):
-    """Проверка статуса счёта CryptoBot (True если оплачен)."""
     inv, err = cryptobot_get_invoice(invoice_id)
     if err:
         return False, err
     return inv.get("status") == "paid", None
 
 async def finalize_premium_purchase(user_id: int, days: int, provider: str, provider_ref: str):
-    """Выдача премиума после оплаты и лог в чат модерации."""
     if not db.is_user_registered(user_id):
         return False
     ok = await asyncio.to_thread(
@@ -616,7 +619,6 @@ def is_admin(user_id):
     return user_id in ADMINS
 
 async def safe_delete_message(chat_id, message_id):
-    """Безопасное удаление сообщения с обработкой ошибок"""
     try:
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
@@ -724,7 +726,8 @@ async def redirect_all_players_to_active_lobbies(lobby_id):
                 try:
                     await bot.send_message(
                         chat_id=player_id,
-                        text=f"{pe('❌')} Лобби #{lobby_unique_id} было удалено хостером!"
+                        text=f"{pe('❌')} Лобби #{lobby_unique_id} было удалено хостером!",
+                        parse_mode='HTML'
                     )
                 except Exception as e:
                     logger.warning(f"Error sending alert to {player_id}: {e}")
