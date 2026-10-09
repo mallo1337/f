@@ -360,8 +360,8 @@ def get_edit_profile_keyboard():
 
 def get_premium_period_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🗓 30 days — $1.32", callback_data="premium_pick_30", icon="🗓")],
-        [btn("📆 90 days — $2.64", callback_data="premium_pick_90", icon="📆")],
+        [btn("🗓 30 days — $1.00", callback_data="premium_pick_30", icon="🗓")],
+        [btn("📆 90 days — $2.00", callback_data="premium_pick_90", icon="📆")],
         [btn("◀️ Назад", callback_data="back_to_main", icon="◀️")],
     ])
 
@@ -402,14 +402,11 @@ def is_valid_game_id(game_id):
 
 def display_nickname(user_id, nickname):
     name = nickname or ""
-    parts = [name]
     if is_admin(user_id):
-        parts.append(pe("✔"))       
+        return f"{name} {pe('✔')}"          # админ — только ✔, без ⭐️
     if db.is_premium(user_id):
-        parts.append(pe("⭐️"))
-    if len(parts) == 1:
-        return name
-    return " ".join(parts)
+        return f"{name} {pe('⭐️')}"         # премиум без админки — только ⭐️
+    return name
 
 def premium_until_human(premium_until_str):
     if not premium_until_str:
