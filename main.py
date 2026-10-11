@@ -805,7 +805,7 @@ async def notify_player_about_processing(user_id, lobby_unique_id, kills, deaths
             base_r = kills + 1
             if db.is_premium(user_id) and rating_added != base_r:
                 lines.append(f"{pe('⭐️')} Premium: к +{base_r} применён множитель ×1.5")
-            lines.extend(["", "По вопросам к @bosin1337"])
+            lines.extend(["", "По вопросам к @uglymatthey"])
             notification_text = "\n".join(lines)
             await bot.send_message(chat_id=user_id, text=notification_text, parse_mode='HTML')
     except Exception as e:
