@@ -1165,7 +1165,7 @@ async def cmd_revert_stats(message: types.Message):
                         f"• Убийств: -{kills_added}\n"
                         f"• Смертей: -{deaths_added}\n"
                         f"{pe('🏆')} Рейтинг: -{rating_added}\n\n"
-                        f"По вопросам к @bosin1337"
+                        f"По вопросам к @uglymatthey"
                     )
                     await bot.send_message(chat_id=user_id, text=notification_text, parse_mode='HTML')
                 except Exception as e:
