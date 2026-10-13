@@ -152,6 +152,7 @@ class Database:
             
             self.conn.commit()
             self._migrate_players_profile_premium()
+            self._migrate_owner_panel_tables()
             logger.info("Tables created successfully")
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
@@ -175,6 +176,257 @@ class Database:
             logger.error(f"Migration players premium columns failed: {e}")
             self.conn.rollback()
     
+    def _migrate_owner_panel_tables(self):
+        """Таблицы для панели владельца: админы из базы и журнал действий."""
+        try:
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bot_admins (
+                    user_id BIGINT PRIMARY KEY,
+                    added_by BIGINT,
+                    created_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS admin_actions (
+                    id SERIAL PRIMARY KEY,
+                    admin_id BIGINT,
+                    action TEXT,
+                    target_id BIGINT,
+                    details TEXT,
+                    created_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS match_result_posts (
+                    lobby_id INTEGER PRIMARY KEY,
+                    posted_at TEXT
+                )
+            ''')
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Migration owner panel tables failed: {e}")
+            self.conn.rollback()
+
+    @staticmethod
+    def _now_str():
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---------- админы из базы ----------
+    def get_bot_admin_ids(self):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT user_id FROM bot_admins ORDER BY created_at")
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return [r[0] for r in rows]
+        except Exception as e:
+            logger.error(f"Error loading bot admins: {e}")
+            self.conn.rollback()
+            return []
+
+    def add_bot_admin(self, user_id, added_by):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "INSERT INTO bot_admins (user_id, added_by, created_at) VALUES (%s, %s, %s) ON CONFLICT (user_id) DO NOTHING",
+                (user_id, added_by, self._now_str()),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error adding bot admin {user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def remove_bot_admin(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("DELETE FROM bot_admins WHERE user_id = %s", (user_id,))
+            removed = self.cursor.rowcount > 0
+            self.conn.commit()
+            return removed
+        except Exception as e:
+            logger.error(f"Error removing bot admin {user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    # ---------- журнал действий владельца ----------
+    def log_admin_action(self, admin_id, action, target_id=None, details=None):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "INSERT INTO admin_actions (admin_id, action, target_id, details, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (admin_id, action, target_id, details, self._now_str()),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error logging admin action: {e}")
+            self.conn.rollback()
+
+    # ---------- поиск игрока ----------
+    def find_player_id(self, query):
+        """Ищет игрока по Telegram ID, игровому ID, нику или @username. Возвращает user_id или None."""
+        q = (query or "").strip()
+        if not q:
+            return None
+        try:
+            self.ensure_connection()
+            if q.lstrip("-").isdigit():
+                self.cursor.execute("SELECT user_id FROM players WHERE user_id = %s", (int(q),))
+                row = self.cursor.fetchone()
+                if row:
+                    return row[0]
+            self.cursor.execute("SELECT user_id FROM players WHERE LOWER(game_id) = LOWER(%s)", (q,))
+            row = self.cursor.fetchone()
+            if row:
+                return row[0]
+            self.cursor.execute("SELECT user_id FROM players WHERE LOWER(nickname) = LOWER(%s)", (q,))
+            row = self.cursor.fetchone()
+            if row:
+                return row[0]
+            self.cursor.execute("SELECT user_id FROM players WHERE LOWER(username) = LOWER(%s)", (q if q.startswith("@") else "@" + q,))
+            row = self.cursor.fetchone()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error finding player '{q}': {e}")
+            self.conn.rollback()
+            return None
+
+    # ---------- действия владельца над игроком ----------
+    def set_player_rating(self, user_id, rating):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE player_stats SET rating = %s WHERE user_id = %s", (max(0, int(rating)), user_id))
+            ok = self.cursor.rowcount > 0
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error setting rating for {user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def grant_premium_days(self, user_id, days):
+        """Выдаёт дни Premium вручную (без бонуса +100 рейтинга). Возвращает новую дату окончания или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT premium_until FROM players WHERE user_id = %s", (user_id,))
+            row = self.cursor.fetchone()
+            if row is None:
+                self.conn.commit()
+                return None
+            now = datetime.now()
+            base = now
+            if row[0]:
+                try:
+                    cur = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
+                    if cur > now:
+                        base = cur
+                except ValueError:
+                    pass
+            new_until = (base + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute("UPDATE players SET premium_until = %s WHERE user_id = %s", (new_until, user_id))
+            self.cursor.execute(
+                "INSERT INTO premium_transactions (user_id, days, provider, provider_ref, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (user_id, int(days), "owner_grant", f"owner_grant_{user_id}_{int(now.timestamp() * 1000)}", self._now_str()),
+            )
+            self.conn.commit()
+            return new_until
+        except Exception as e:
+            logger.error(f"Error granting premium to {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def remove_premium(self, user_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE players SET premium_until = NULL WHERE user_id = %s", (user_id,))
+            ok = self.cursor.rowcount > 0
+            self.conn.commit()
+            return ok
+        except Exception as e:
+            logger.error(f"Error removing premium for {user_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def get_admin_stats(self):
+        """Сводка для панели владельца."""
+        try:
+            self.ensure_connection()
+            now = datetime.now()
+            now_s = now.strftime("%Y-%m-%d %H:%M:%S")
+            day_ago = (now - timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+            week_ago = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+            month_ago = (now - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
+            today = now.strftime("%Y-%m-%d") + " 00:00:00"
+            c = self.cursor
+            def one(sql, params=()):
+                c.execute(sql, params)
+                return c.fetchone()[0]
+            stats = {
+                "players_total": one("SELECT COUNT(*) FROM players"),
+                "players_24h": one("SELECT COUNT(*) FROM players WHERE registration_date >= %s", (day_ago,)),
+                "players_7d": one("SELECT COUNT(*) FROM players WHERE registration_date >= %s", (week_ago,)),
+                "lobbies_total": one("SELECT COUNT(*) FROM lobbies"),
+                "lobbies_active": one("SELECT COUNT(*) FROM lobbies WHERE status = 'active'"),
+                "lobbies_completed": one("SELECT COUNT(*) FROM lobbies WHERE status = 'completed'"),
+                "lobbies_today": one("SELECT COUNT(*) FROM lobbies WHERE created_at >= %s", (today,)),
+                "stats_entries": one("SELECT COUNT(*) FROM stats_history"),
+                "premium_active": one("SELECT COUNT(*) FROM players WHERE premium_until IS NOT NULL AND premium_until > %s", (now_s,)),
+                "premium_buys_30d": one("SELECT COUNT(*) FROM premium_transactions WHERE provider <> 'owner_grant' AND created_at >= %s", (month_ago,)),
+                "premium_buys_total": one("SELECT COUNT(*) FROM premium_transactions WHERE provider <> 'owner_grant'"),
+            }
+            self.conn.commit()
+            return stats
+        except Exception as e:
+            logger.error(f"Error getting admin stats: {e}")
+            self.conn.rollback()
+            return None
+
+    # ---------- итоги матча ----------
+    def get_lobby_match_results(self, lobby_id):
+        """[(user_id, nickname, kills, deaths, rating_added)] — по убыванию убийств."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT sh.user_id, p.nickname, sh.kills_added, sh.deaths_added, sh.rating_added
+                   FROM stats_history sh JOIN players p ON p.user_id = sh.user_id
+                   WHERE sh.lobby_id = %s
+                   ORDER BY sh.kills_added DESC, sh.deaths_added ASC""",
+                (lobby_id,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error getting match results for lobby {lobby_id}: {e}")
+            self.conn.rollback()
+            return []
+
+    def mark_match_posted(self, lobby_id):
+        """True — отметили впервые (можно публиковать), False — уже публиковали."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "INSERT INTO match_result_posts (lobby_id, posted_at) VALUES (%s, %s) ON CONFLICT (lobby_id) DO NOTHING RETURNING lobby_id",
+                (lobby_id, self._now_str()),
+            )
+            first = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return first
+        except Exception as e:
+            logger.error(f"Error marking match posted {lobby_id}: {e}")
+            self.conn.rollback()
+            return False
+
+    def unmark_match_posted(self, lobby_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("DELETE FROM match_result_posts WHERE lobby_id = %s", (lobby_id,))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error unmarking match posted {lobby_id}: {e}")
+            self.conn.rollback()
+
     def create_indexes(self):
         try:
             indexes = [
@@ -668,6 +920,39 @@ class Database:
             logger.error(f"Error creating lobby for user {creator_id}: {e}")
             self.conn.rollback()
             return None, None
+
+    def count_open_lobbies(self):
+        """Сколько лобби сейчас набирают игроков (статус active)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT COUNT(*) FROM lobbies WHERE status = 'active'")
+            count = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return count
+        except Exception as e:
+            logger.error(f"Error counting open lobbies: {e}")
+            self.conn.rollback()
+            return 0
+
+    def get_expired_empty_lobbies(self, minutes):
+        """Лобби старше N минут, где никого, кроме создателя, нет: [(lobby_id, lobby_unique_id, creator_id)]."""
+        try:
+            self.ensure_connection()
+            cutoff = (datetime.now() - timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                """SELECT l.lobby_id, l.lobby_unique_id, l.creator_id
+                   FROM lobbies l
+                   WHERE l.status = 'active' AND l.created_at <= %s
+                     AND (SELECT COUNT(*) FROM lobby_players lp WHERE lp.lobby_id = l.lobby_id) <= 1""",
+                (cutoff,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error getting expired empty lobbies: {e}")
+            self.conn.rollback()
+            return []
 
     def get_active_lobbies(self):
         try:

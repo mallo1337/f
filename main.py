@@ -66,6 +66,17 @@ load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 MODERATOR_GROUP_ID = os.getenv('MODERATOR_GROUP_ID')
 CHANNEL_ID = os.getenv('CHANNEL_ID')
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except ValueError:
+        return default
+
+# Лобби создают игроки. Настройки (можно менять переменными окружения на Render):
+MAX_OPEN_LOBBIES = _env_int('MAX_OPEN_LOBBIES', 3)                  # сколько лобби могут набирать игроков одновременно
+LOBBY_EMPTY_TIMEOUT_MIN = _env_int('LOBBY_EMPTY_TIMEOUT_MIN', 15)   # через сколько минут пустое лобби удаляется
+ADMINS_CAN_CREATE_LOBBY = os.getenv('ADMINS_CAN_CREATE_LOBBY', 'false').strip().lower() in ('true', '1', 'yes', 'on')
 MENU_IMAGE_URL = os.getenv('MENU_IMAGE_URL')
 PROFILE_IMAGE_URL = os.getenv('PROFILE_IMAGE_URL')
 TOP_IMAGE_URL = os.getenv('TOP_IMAGE_URL')
@@ -84,6 +95,7 @@ PREMIUM_STARS_30 = 29
 PREMIUM_STARS_90 = 49
 
 pending_cryptobot_invoices = {}
+pending_lobby_join = {}  # user_id -> lobby_id (человек пришёл по ссылке из канала, но ещё не зарегистрирован)
 
 # ---- PREMIUM EMOJI ----
 # Ключ = сам эмодзи (fallback), значение = (emoji_id, fallback).
@@ -266,6 +278,27 @@ def load_admins():
         return []
 
 ADMINS = load_admins()
+FILE_ADMINS = set(ADMINS)  # админы из admins.txt (из панели их убрать нельзя)
+
+# Владелец бота (доступ к панели /kp). Задаётся переменной OWNER_ID, иначе — первый ID из admins.txt
+_owner_env = os.getenv('OWNER_ID', '').strip()
+if _owner_env.isdigit():
+    OWNER_ID = int(_owner_env)
+else:
+    OWNER_ID = ADMINS[0] if ADMINS else None
+
+def is_owner(user_id):
+    return OWNER_ID is not None and user_id == OWNER_ID
+
+# Админы, добавленные через панель владельца, хранятся в базе
+try:
+    for _uid in db.get_bot_admin_ids():
+        if _uid not in ADMINS:
+            ADMINS.append(_uid)
+except Exception as _e:
+    logger.error(f"Error loading admins from database: {_e}")
+if OWNER_ID is not None and OWNER_ID not in ADMINS:
+    ADMINS.append(OWNER_ID)
 
 class RegistrationStates(StatesGroup):
     waiting_for_nickname = State()
@@ -319,7 +352,7 @@ def get_main_keyboard(user_id=None):
         [btn("🎮 Активные лобби", callback_data="active_lobbies", icon="🎮")],
     ]
 
-    if user_id and is_admin(user_id):
+    if user_id and can_create_lobby(user_id):
         keyboard.append([btn("➕ Создать лобби", callback_data="create_lobby", icon="➕")])
 
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -613,6 +646,12 @@ def get_region_keyboard():
     keyboard.append([btn("◀️ Назад", callback_data="create_lobby", icon="◀️")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
+def can_create_lobby(user_id):
+    """Лобби создают игроки. Администраторы не создают (если не включено ADMINS_CAN_CREATE_LOBBY)."""
+    if is_admin(user_id) and not ADMINS_CAN_CREATE_LOBBY:
+        return False
+    return True
+
 def is_admin(user_id):
     return user_id in ADMINS
 
@@ -811,6 +850,67 @@ async def notify_player_about_processing(user_id, lobby_unique_id, kills, deaths
     except Exception as e:
         logger.error(f"Error notifying player {user_id}: {e}")
 
+_bot_username_cache = None
+
+async def get_bot_username():
+    """Имя бота для ссылок (берётся у Телеграма, а не зашито в коде)."""
+    global _bot_username_cache
+    if not _bot_username_cache:
+        try:
+            me = await bot.get_me()
+            _bot_username_cache = me.username
+        except Exception as e:
+            logger.error(f"Cannot get bot username: {e}")
+            _bot_username_cache = (os.getenv('BOT_USERNAME') or '').lstrip('@') or None
+    return _bot_username_cache
+
+async def make_bot_link(start_param=None):
+    username = await get_bot_username()
+    if not username:
+        return None
+    return f"https://t.me/{username}" + (f"?start={start_param}" if start_param else "")
+
+async def send_lobby_view_to_user(user_id, lobby_id):
+    """Отправляет одному игроку актуальное сообщение лобби."""
+    lobby_info = db.get_lobby_by_id(lobby_id)
+    if not lobby_info:
+        return False
+    players = db.get_lobby_players(lobby_id)
+    players_count = len(players)
+    max_players = lobby_info[9]
+    creator_user_info = await bot.get_chat(lobby_info[2])
+    creator_first_name = creator_user_info.first_name if creator_user_info else None
+    lobby_text, _ = format_lobby_info(lobby_info, players, creator_first_name)
+    keyboard = get_lobby_actions_keyboard(
+        lobby_id, user_id,
+        is_creator=(user_id == lobby_info[2]),
+        players_count=players_count,
+        max_players=max_players,
+        lobby_full=players_count >= max_players
+    )
+    old_message_id = user_lobby_messages.get(user_id)
+    if old_message_id:
+        await safe_delete_message(chat_id=user_id, message_id=old_message_id)
+    new_message = await bot.send_message(chat_id=user_id, text=lobby_text, reply_markup=keyboard, parse_mode='HTML')
+    user_lobby_messages.put(user_id, new_message.message_id)
+    return True
+
+async def join_lobby_from_link(chat_id, user_id, lobby_id):
+    """Вход в лобби по кнопке из канала (ссылка t.me/бот?start=lobby_<id>)."""
+    error = None
+    lobby_info = db.get_lobby_by_id(lobby_id)
+    if not lobby_info:
+        error = "Это лобби уже недоступно: оно удалено или завершено."
+    elif db.is_user_in_lobby(user_id, lobby_id):
+        await send_lobby_view_to_user(user_id, lobby_id)
+        return
+    else:
+        success, error = await perform_lobby_join(user_id, lobby_id)
+        if success:
+            return  # сообщение с лобби игрок получает из update_lobby_message_for_all_players
+    await bot.send_message(chat_id=chat_id, text=f"❌ {error}")
+    await send_message_with_image(chat_id, f"{pe('👋')} Выберите действие:", MENU_IMAGE_URL, get_main_keyboard(user_id))
+
 async def send_lobby_to_channel(lobby_id):
     try:
         lobby_info = db.get_lobby_info_for_channel(lobby_id)
@@ -827,7 +927,7 @@ async def send_lobby_to_channel(lobby_id):
 
         message_text = (
             f"Лобби #{lobby_unique_id} активно{pe('❗️')}\n\n"
-            f"{pe('🎮')} Режим: {mode} от {creator_tg_name}\n"
+            f"{pe('🎮')} Режим: {mode} от {esc(creator_tg_name)}\n"
             f"Оружия: {mode_weapons}\n"
             f"Карта: {map_name}\n"
             f"{pe('⏳')} Время: {time_limit}\n"
@@ -835,18 +935,36 @@ async def send_lobby_to_channel(lobby_id):
             f"{pe('🌍')} Регион: {region}"
         )
 
-        join_keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [btn("🎮 Присоединиться к лобби", url="https://t.me/KingDM_robot?start=join_lobby", icon="🎮")]
-            ]
-        )
+        join_url = await make_bot_link(f"lobby_{lobby_id}")
+        join_keyboard = None
+        plain_keyboard = None
+        if join_url:
+            join_keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [btn("🎮 Присоединиться к лобби", url=join_url, icon="🎮")]
+                ]
+            )
+            plain_keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="🎮 Присоединиться к лобби", url=join_url)]
+                ]
+            )
 
-        message = await bot.send_message(
-            chat_id=CHANNEL_ID,
-            text=message_text,
-            reply_markup=join_keyboard,
-            parse_mode='HTML'
-        )
+        try:
+            message = await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=message_text,
+                reply_markup=join_keyboard,
+                parse_mode='HTML'
+            )
+        except Exception as premium_error:
+            # В каналах премиум-эмодзи доступны не всегда — шлём обычную версию
+            logger.warning(f"Channel post with premium emoji failed ({premium_error}), sending plain version")
+            message = await bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=html.unescape(re.sub(r"<[^>]+>", "", message_text)),
+                reply_markup=plain_keyboard
+            )
 
         return message.message_id
     except Exception as e:
@@ -946,8 +1064,12 @@ async def set_bot_commands_for_user(user_id):
             types.BotCommand(command="post", description="📢 Рассылка"),
             types.BotCommand(command="botstat", description="📊 Статистика бота"),
             types.BotCommand(command="upd", description="📈 Обновить статистику"),
-            types.BotCommand(command="backupd", description="↩️ Откатить статистику")
+            types.BotCommand(command="backupd", description="↩️ Откатить статистику"),
+            types.BotCommand(command="postmatch", description="📣 Итоги матча в канал")
         ])
+
+    if is_owner(user_id):
+        commands.append(types.BotCommand(command="kp", description="🛠 Панель владельца"))
 
     try:
         await bot.set_my_commands(commands, scope=types.BotCommandScopeChat(chat_id=user_id))
@@ -982,6 +1104,24 @@ async def cmd_start(message: types.Message):
     await cleanup_user_messages(user_id)
 
     args = message.text.split()
+    if len(args) > 1 and args[1].startswith("lobby_"):
+        try:
+            link_lobby_id = int(args[1][len("lobby_"):])
+        except ValueError:
+            link_lobby_id = None
+        if link_lobby_id is not None:
+            if db.is_user_registered(user_id):
+                await join_lobby_from_link(message.chat.id, user_id, link_lobby_id)
+            else:
+                pending_lobby_join[user_id] = link_lobby_id
+                await message.answer(
+                    f"{pe('👋')} Привет, {esc(first_name)}!\n\nДля участия в лобби нужно зарегистрироваться. "
+                    f"После регистрации я сразу добавлю вас в лобби:",
+                    reply_markup=get_registration_keyboard(),
+                    parse_mode='HTML'
+                )
+            return
+
     if len(args) > 1 and args[1] == "join_lobby":
         if db.is_user_registered(user_id):
             await send_message_with_image(message.chat.id,
@@ -1112,6 +1252,12 @@ async def cmd_update_stats(message: types.Message):
             if success:
                 await message.answer(f"{pe('✅')} Статистика для игрока {tg_id} в лобби #{lobby_unique_id} обновлена!", parse_mode='HTML')
                 await notify_player_about_processing(tg_id, lobby_unique_id, kills, deaths, rating_added)
+                try:
+                    posted, _ = await maybe_post_match_result(lobby_id)
+                    if posted:
+                        await message.answer("📣 Результаты матча опубликованы в канале.")
+                except Exception as e:
+                    logger.error(f"Error posting match result: {e}")
             else:
                 await message.answer(f"{pe('❌')} Ошибка при обновлении статистики.", parse_mode='HTML')
 
@@ -1194,7 +1340,7 @@ async def cmd_post(message: types.Message, state: FSMContext):
             "• *жирный*\n"
             "• _курсив_\n"
             "• `моноширинный`\n"
-            "• [ссылка](t.me/KingDM_robot)"
+            "• [ссылка](https://example.com)"
         )
         return
 
@@ -1326,12 +1472,25 @@ async def cancel_broadcast(callback_query: types.CallbackQuery, state: FSMContex
 
 @dp.callback_query(lambda c: c.data == "create_lobby")
 async def start_create_lobby(callback_query: types.CallbackQuery, state: FSMContext):
-    if not is_admin(callback_query.from_user.id):
-        await callback_query.answer("❌ Нет прав для создания лобби", show_alert=True)
+    creator_check_id = callback_query.from_user.id
+    if not db.is_user_registered(creator_check_id):
+        await callback_query.answer("❌ Сначала зарегистрируйтесь", show_alert=True)
         return
 
-    if db.get_user_active_lobby(callback_query.from_user.id):
+    if not can_create_lobby(creator_check_id):
+        await callback_query.answer("❌ Администраторы не создают лобби", show_alert=True)
+        return
+
+    if db.get_user_active_lobby(creator_check_id):
         await callback_query.answer("❌ Вы уже находитесь в активном лобби", show_alert=True)
+        return
+
+    if db.count_open_lobbies() >= MAX_OPEN_LOBBIES:
+        await callback_query.answer(
+            f"❌ Сейчас открыто максимум лобби ({MAX_OPEN_LOBBIES}). Подождите, пока освободится место, "
+            f"или присоединитесь к одному из них.",
+            show_alert=True
+        )
         return
 
     await cleanup_user_messages(callback_query.from_user.id)
@@ -1434,6 +1593,19 @@ async def process_lobby_region(callback_query: types.CallbackQuery, state: FSMCo
         if 0 <= region_index < len(REGIONS):
             region = REGIONS[region_index]
             data = await state.get_data()
+
+            if db.count_open_lobbies() >= MAX_OPEN_LOBBIES:
+                # пока игрок заполнял анкету, свободные места могли закончиться
+                await state.clear()
+                await cleanup_user_messages(user_id)
+                await send_message_with_image(
+                    user_id,
+                    f"{pe('❌')} Пока вы создавали лобби, свободные места закончились (максимум {MAX_OPEN_LOBBIES}). Попробуйте позже.",
+                    None,
+                    get_main_keyboard(user_id)
+                )
+                await callback_query.answer()
+                return
 
             lobby_id, lobby_unique_id = db.create_lobby(
                 creator_id=user_id,
@@ -1560,72 +1732,88 @@ async def view_lobby(callback_query: types.CallbackQuery):
 
     await callback_query.answer()
 
+async def perform_lobby_join(user_id, lobby_id, on_joined=None):
+    """Добавляет игрока в лобби и запускает всё, что должно произойти дальше.
+    Возвращает (успех, текст_ошибки)."""
+    try:
+        if db.get_user_active_lobby(user_id):
+            return False, "Вы уже находитесь в активном лобби"
+
+        success, message = db.join_lobby(user_id, lobby_id)
+        if not success:
+            return False, message
+
+        if on_joined:
+            try:
+                await on_joined()
+            except Exception as e:
+                logger.warning(f"on_joined failed: {e}")
+
+        lobby_info = db.get_lobby_by_id(lobby_id)
+        if not lobby_info:
+            return False, "Лобби не найдено"
+
+        players = db.get_lobby_players(lobby_id)
+        players_count = len(players)
+        max_players = lobby_info[9]
+
+        lobby_full = players_count >= max_players
+
+        if lobby_full and lobby_info[1]:
+            db.complete_lobby(lobby_id)
+
+            await delete_lobby_channel_message(lobby_id)
+
+            existing_topic_thread_id = db.get_lobby_topic_thread_id(lobby_id)
+            if not existing_topic_thread_id:
+                topic_thread_id = await create_lobby_forum_topic(lobby_info[1], lobby_info, players)
+                if topic_thread_id:
+                    db.update_lobby_topic_thread_id(lobby_id, topic_thread_id)
+
+            await update_lobby_message_for_all_players(lobby_id)
+
+            try:
+                notification_text = (
+                    f"{pe('🎉')} Лобби №{lobby_info[1]} заполнено!\n\n"
+                    f"{pe('✅')} Набралось {players_count} игроков\n"
+                    f"{pe('🎮')} Скопируйте id хостера чтобы присоединиться.\n"
+                    f"{pe('📸')} После игры отправьте скриншот с результатами!"
+                )
+
+                for player_id, player_nickname in players:
+                    try:
+                        await bot.send_message(chat_id=player_id, text=notification_text, parse_mode='HTML')
+                    except Exception as e:
+                        logger.warning(f"Error sending notification to {player_id}: {e}")
+                        continue
+            except Exception as e:
+                logger.error(f"Error sending lobby filled notification: {e}")
+        else:
+            await update_lobby_message_for_all_players(lobby_id)
+
+        return True, None
+    except Exception as e:
+        logger.error(f"Error joining lobby: {e}")
+        return False, "Ошибка при присоединении к лобби"
+
 @dp.callback_query(lambda c: c.data.startswith("join_lobby_"))
 async def join_lobby(callback_query: types.CallbackQuery):
     try:
         lobby_id = int(callback_query.data.replace("join_lobby_", ""))
-        user_id = callback_query.from_user.id
-
-        if db.get_user_active_lobby(user_id):
-            await callback_query.answer("❌ Вы уже находитесь в активном лобби", show_alert=True)
-            return
-
-        success, message = db.join_lobby(user_id, lobby_id)
-
-        if success:
-            await callback_query.answer("✅ Вы присоединились к лобби")
-
-            lobby_info = db.get_lobby_by_id(lobby_id)
-            if not lobby_info:
-                await callback_query.answer("❌ Лобби не найдено", show_alert=True)
-                return
-
-            players = db.get_lobby_players(lobby_id)
-            players_count = len(players)
-            max_players = lobby_info[9]
-
-            is_creator = lobby_info[2] == user_id
-            lobby_full = players_count >= max_players
-
-            if lobby_full and lobby_info[1]:
-                db.complete_lobby(lobby_id)
-
-                await delete_lobby_channel_message(lobby_id)
-
-                existing_topic_thread_id = db.get_lobby_topic_thread_id(lobby_id)
-                if not existing_topic_thread_id:
-                    topic_thread_id = await create_lobby_forum_topic(lobby_info[1], lobby_info, players)
-                    if topic_thread_id:
-                        db.update_lobby_topic_thread_id(lobby_id, topic_thread_id)
-
-                await update_lobby_message_for_all_players(lobby_id)
-
-                try:
-                    notification_text = (
-                        f"{pe('🎉')} Лобби №{lobby_info[1]} заполнено!\n\n"
-                        f"{pe('✅')} Набралось {players_count} игроков\n"
-                        f"{pe('🎮')} Скопируйте id хостера чтобы присоединиться.\n"
-                        f"{pe('📸')} После игры отправьте скриншот с результатами!"
-                    )
-
-                    for player_id, player_nickname in players:
-                        try:
-                            await bot.send_message(chat_id=player_id, text=notification_text, parse_mode='HTML')
-                        except Exception as e:
-                            logger.warning(f"Error sending notification to {player_id}: {e}")
-                            continue
-                except Exception as e:
-                    logger.error(f"Error sending lobby filled notification: {e}")
-            else:
-                await update_lobby_message_for_all_players(lobby_id)
-
-        else:
-            await callback_query.answer(f"❌ {message}", show_alert=True)
     except ValueError:
         await callback_query.answer("❌ Неверный ID лобби", show_alert=True)
-    except Exception as e:
-        logger.error(f"Error joining lobby: {e}")
-        await callback_query.answer("❌ Ошибка при присоединении к лобби", show_alert=True)
+        return
+    user_id = callback_query.from_user.id
+
+    async def answer_joined():
+        await callback_query.answer("✅ Вы присоединились к лобби")
+
+    success, error = await perform_lobby_join(user_id, lobby_id, on_joined=answer_joined)
+    if not success:
+        try:
+            await callback_query.answer(f"❌ {error}", show_alert=True)
+        except Exception as e:
+            logger.warning(f"Cannot answer join error: {e}")
 
 @dp.callback_query(lambda c: c.data.startswith("leave_lobby_"))
 async def leave_lobby(callback_query: types.CallbackQuery):
@@ -1922,6 +2110,13 @@ async def process_game_id(message: types.Message, state: FSMContext):
         await state.clear()
         menu_text = f"{pe('✅')} Регистрация завершена!\n\n{pe('👋')} Добро пожаловать, {nickname}!\n\nВыберите действие:"
         await send_message_with_image(message.chat.id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
+
+        pending_lobby_id = pending_lobby_join.pop(user_id, None)
+        if pending_lobby_id is not None:
+            try:
+                await join_lobby_from_link(message.chat.id, user_id, pending_lobby_id)
+            except Exception as e:
+                logger.error(f"Error joining lobby after registration: {e}")
     else:
         await message.answer(f"{pe('❌')} {message_text}", parse_mode='HTML')
 
@@ -1929,6 +2124,7 @@ async def process_game_id(message: types.Message, state: FSMContext):
 async def cancel_registration(callback_query: types.CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = callback_query.from_user.id
+    pending_lobby_join.pop(user_id, None)
     first_name = callback_query.from_user.first_name
 
     await cleanup_user_messages(user_id)
@@ -2638,6 +2834,455 @@ async def back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
     await send_message_with_image(user_id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
     await callback_query.answer()
 
+# ======================================================================
+# ПАНЕЛЬ ВЛАДЕЛЬЦА (/kp) — скрытая команда, отвечает только владельцу
+# ======================================================================
+class OwnerStates(StatesGroup):
+    waiting_for_search = State()
+    waiting_for_rating = State()
+    waiting_for_admin = State()
+
+
+def strip_tags(text):
+    """Убирает HTML-теги (в т.ч. <tg-emoji>), оставляя обычный эмодзи-запасной вариант."""
+    return html.unescape(re.sub(r"<[^>]+>", "", str(text)))
+
+
+def fmt_dt(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
+    except (TypeError, ValueError):
+        return value or "—"
+
+
+def player_label(user_id):
+    p = db.get_player_profile(user_id)
+    nick = p[2] if p else "?"
+    return f"{nick} ({user_id})"
+
+
+def owner_main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Статистика", callback_data="own_stats")],
+        [InlineKeyboardButton(text="🔍 Найти игрока", callback_data="own_search")],
+        [InlineKeyboardButton(text="👮 Админы", callback_data="own_admins")],
+        [InlineKeyboardButton(text="❌ Закрыть", callback_data="own_close")],
+    ])
+
+
+def owner_card_keyboard(uid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✏️ Рейтинг", callback_data=f"own_rate_{uid}"),
+            InlineKeyboardButton(text="🔄 Обновить", callback_data=f"own_card_{uid}"),
+        ],
+        [
+            InlineKeyboardButton(text="⭐ +30 дн.", callback_data=f"own_prem_{uid}_30"),
+            InlineKeyboardButton(text="⭐ +90 дн.", callback_data=f"own_prem_{uid}_90"),
+            InlineKeyboardButton(text="🗑 Снять", callback_data=f"own_unprem_{uid}"),
+        ],
+        [InlineKeyboardButton(text="◀️ В панель", callback_data="own_menu")],
+    ])
+
+
+def build_player_card(user_id):
+    p = db.get_player_profile(user_id)
+    if not p:
+        return None
+    _, username, nickname, game_id, reg_date, rating, matches, kills, deaths, _, _, premium_until = p
+    rating, matches, kills, deaths = rating or 0, matches or 0, kills or 0, deaths or 0
+    kd = kills / deaths if deaths > 0 else kills
+    days_left = db.get_premium_days_left(user_id)
+    premium_text = f"до {fmt_dt(premium_until)} ({days_left} дн.)" if days_left > 0 else "нет"
+    role = " (админ)" if is_admin(user_id) else ""
+    return (
+        f"👤 {nickname}{role}\n"
+        f"Telegram ID: {user_id}\n"
+        f"Игровой ID: {game_id}\n"
+        f"Username: {username or '—'}\n"
+        f"Регистрация: {fmt_dt(reg_date)}\n\n"
+        f"🏆 Рейтинг: {rating} {strip_tags(get_player_level(rating))}\n"
+        f"🎮 Матчей: {matches}\n"
+        f"🎯 Убийств/смертей: {kills}/{deaths} (K/D {kd:.2f})\n\n"
+        f"⭐️ Premium: {premium_text}"
+    )
+
+
+async def owner_guard(callback_query):
+    if not is_owner(callback_query.from_user.id):
+        await callback_query.answer("Только для владельца.", show_alert=True)
+        return False
+    return True
+
+
+async def owner_edit(callback_query, text, keyboard):
+    try:
+        await callback_query.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            await callback_query.message.answer(text, reply_markup=keyboard)
+
+
+@dp.message(Command("kp"))
+async def cmd_panel(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return  # команда скрытая: остальным бот не отвечает
+    if message.chat.type != "private":
+        await message.answer("Панель владельца доступна только в личных сообщениях с ботом.")
+        return
+    await state.clear()
+    await message.answer("🛠 Панель владельца", reply_markup=owner_main_keyboard())
+
+
+@dp.callback_query(lambda c: c.data == "own_menu")
+async def own_menu(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    await state.clear()
+    await owner_edit(callback_query, "🛠 Панель владельца", owner_main_keyboard())
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data == "own_close")
+async def own_close(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    await state.clear()
+    try:
+        await callback_query.message.delete()
+    except Exception:
+        pass
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data == "own_stats")
+async def own_stats(callback_query: types.CallbackQuery):
+    if not await owner_guard(callback_query):
+        return
+    s = db.get_admin_stats()
+    if not s:
+        await callback_query.answer("Ошибка при получении статистики.", show_alert=True)
+        return
+    text = (
+        "📊 Статистика бота\n\n"
+        f"👥 Игроков: {s['players_total']}\n"
+        f"   • за 24 часа: +{s['players_24h']}\n"
+        f"   • за 7 дней: +{s['players_7d']}\n\n"
+        f"🎮 Лобби всего: {s['lobbies_total']}\n"
+        f"   • сегодня создано: {s['lobbies_today']}\n"
+        f"   • набираются сейчас: {s['lobbies_active']}\n"
+        f"   • сыграно: {s['lobbies_completed']}\n"
+        f"   • начислений статистики: {s['stats_entries']}\n\n"
+        f"⭐️ Premium активен у: {s['premium_active']}\n"
+        f"   • покупок за 30 дней: {s['premium_buys_30d']}\n"
+        f"   • покупок всего: {s['premium_buys_total']}"
+    )
+    await owner_edit(callback_query, text, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить", callback_data="own_stats")],
+        [InlineKeyboardButton(text="◀️ В панель", callback_data="own_menu")],
+    ]))
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data == "own_search")
+async def own_search(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    await state.set_state(OwnerStates.waiting_for_search)
+    await owner_edit(
+        callback_query,
+        "🔍 Отправьте ник, Telegram ID, игровой ID или @username игрока.",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="own_menu")]]),
+    )
+    await callback_query.answer()
+
+
+@dp.message(OwnerStates.waiting_for_search)
+async def own_search_query(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    target = db.find_player_id(message.text or "")
+    if not target:
+        await message.answer("❌ Игрок не найден. Пришлите другой запрос или откройте /kp.")
+        return
+    await state.clear()
+    await message.answer(build_player_card(target), reply_markup=owner_card_keyboard(target))
+
+
+@dp.callback_query(lambda c: c.data.startswith("own_card_"))
+async def own_card(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    await state.clear()
+    try:
+        target = int(callback_query.data.replace("own_card_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    card = build_player_card(target)
+    if not card:
+        await callback_query.answer("Игрок не найден.", show_alert=True)
+        return
+    await owner_edit(callback_query, card, owner_card_keyboard(target))
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("own_prem_"))
+async def own_grant_premium(callback_query: types.CallbackQuery):
+    if not await owner_guard(callback_query):
+        return
+    try:
+        _, _, uid_s, days_s = callback_query.data.split("_")
+        target, days = int(uid_s), int(days_s)
+    except ValueError:
+        await callback_query.answer()
+        return
+    if days not in (30, 90):
+        await callback_query.answer()
+        return
+    new_until = db.grant_premium_days(target, days)
+    if not new_until:
+        await callback_query.answer("Не удалось выдать Premium.", show_alert=True)
+        return
+    db.log_admin_action(callback_query.from_user.id, "grant_premium", target, f"+{days} дн. до {new_until}")
+    try:
+        await bot.send_message(chat_id=target, text=f"⭐️ Вам выдан Premium на {days} дн.")
+    except Exception:
+        pass
+    await owner_edit(callback_query, build_player_card(target), owner_card_keyboard(target))
+    await callback_query.answer(f"Выдано {days} дн.")
+
+
+@dp.callback_query(lambda c: c.data.startswith("own_unprem_"))
+async def own_remove_premium(callback_query: types.CallbackQuery):
+    if not await owner_guard(callback_query):
+        return
+    try:
+        target = int(callback_query.data.replace("own_unprem_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    if db.remove_premium(target):
+        db.log_admin_action(callback_query.from_user.id, "remove_premium", target, None)
+    await owner_edit(callback_query, build_player_card(target), owner_card_keyboard(target))
+    await callback_query.answer("Premium снят")
+
+
+@dp.callback_query(lambda c: c.data.startswith("own_rate_"))
+async def own_rate_start(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    try:
+        target = int(callback_query.data.replace("own_rate_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    p = db.get_player_profile(target)
+    if not p:
+        await callback_query.answer("Игрок не найден.", show_alert=True)
+        return
+    await state.set_state(OwnerStates.waiting_for_rating)
+    await state.update_data(rating_target=target)
+    await owner_edit(
+        callback_query,
+        f"✏️ Рейтинг игрока {p[2]}: {p[5] or 0}\n\n"
+        "Отправьте новое значение (например 500) или изменение со знаком (+50 / -30).",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data=f"own_card_{target}")]]),
+    )
+    await callback_query.answer()
+
+
+@dp.message(OwnerStates.waiting_for_rating)
+async def own_rate_value(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    data = await state.get_data()
+    target = data.get("rating_target")
+    raw = (message.text or "").strip().replace(" ", "")
+    if not target or not re.fullmatch(r"[+-]?\d{1,6}", raw):
+        await message.answer("❌ Нужно число, например 500, +50 или -30.")
+        return
+    p = db.get_player_profile(target)
+    if not p:
+        await state.clear()
+        await message.answer("❌ Игрок не найден.")
+        return
+    old = p[5] or 0
+    new = old + int(raw) if raw[0] in "+-" else int(raw)
+    new = max(0, min(new, 100000))
+    if not db.set_player_rating(target, new):
+        await message.answer("❌ Не удалось изменить рейтинг.")
+        return
+    db.log_admin_action(message.from_user.id, "set_rating", target, f"{old} -> {new}")
+    await state.clear()
+    await message.answer(f"✅ Рейтинг изменён: {old} → {new}")
+    await message.answer(build_player_card(target), reply_markup=owner_card_keyboard(target))
+
+
+# ---------- управление админами ----------
+@dp.callback_query(lambda c: c.data == "own_admins")
+async def own_admins(callback_query: types.CallbackQuery, state: FSMContext = None):
+    if not await owner_guard(callback_query):
+        return
+    if state is not None:
+        await state.clear()
+    lines = ["👮 Администраторы бота\n"]
+    rows = []
+    for uid in ADMINS:
+        p = db.get_player_profile(uid)
+        nick = p[2] if p else "не зарегистрирован"
+        if is_owner(uid):
+            tag = " — владелец"
+        elif uid in FILE_ADMINS:
+            tag = " — из admins.txt"
+        else:
+            tag = ""
+        lines.append(f"• {nick} ({uid}){tag}")
+        if not is_owner(uid) and uid not in FILE_ADMINS:
+            rows.append([InlineKeyboardButton(text=f"❌ Убрать: {nick}", callback_data=f"own_admin_del_{uid}")])
+    lines.append("\nАдмины из admins.txt убираются только правкой файла.")
+    rows.append([InlineKeyboardButton(text="➕ Добавить админа", callback_data="own_admin_add")])
+    rows.append([InlineKeyboardButton(text="◀️ В панель", callback_data="own_menu")])
+    await owner_edit(callback_query, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data == "own_admin_add")
+async def own_admin_add(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    await state.set_state(OwnerStates.waiting_for_admin)
+    await owner_edit(
+        callback_query,
+        "➕ Отправьте Telegram ID нового админа (число), либо ник или @username игрока из бота.",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="own_admins")]]),
+    )
+    await callback_query.answer()
+
+
+@dp.message(OwnerStates.waiting_for_admin)
+async def own_admin_add_value(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    raw = (message.text or "").strip()
+    if raw.isdigit():
+        target = int(raw)   # число считаем Telegram ID
+    else:
+        target = db.find_player_id(raw)
+    if not target:
+        await message.answer("❌ Не нашла такого игрока. Пришлите Telegram ID (число) или ник игрока.")
+        return
+    if target in ADMINS:
+        await message.answer("ℹ️ Этот пользователь уже администратор.")
+        return
+    if not db.add_bot_admin(target, message.from_user.id):
+        await message.answer("❌ Не удалось сохранить администратора.")
+        return
+    ADMINS.append(target)
+    db.log_admin_action(message.from_user.id, "add_admin", target, None)
+    await state.clear()
+    try:
+        await bot.send_message(chat_id=target, text="👮 Вам выданы права администратора бота.")
+    except Exception:
+        pass
+    try:
+        await set_bot_commands_for_user(target)
+    except Exception as e:
+        logger.warning(f"Cannot refresh commands for new admin {target}: {e}")
+    await message.answer(
+        f"✅ Админ добавлен: {player_label(target)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="👮 К списку админов", callback_data="own_admins")]]),
+    )
+
+
+@dp.callback_query(lambda c: c.data.startswith("own_admin_del_"))
+async def own_admin_del(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    try:
+        target = int(callback_query.data.replace("own_admin_del_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    if is_owner(target) or target in FILE_ADMINS:
+        await callback_query.answer("Этого админа нельзя убрать из панели.", show_alert=True)
+        return
+    if db.remove_bot_admin(target):
+        if target in ADMINS:
+            ADMINS.remove(target)
+        db.log_admin_action(callback_query.from_user.id, "remove_admin", target, None)
+        try:
+            await bot.send_message(chat_id=target, text="ℹ️ Права администратора бота сняты.")
+        except Exception:
+            pass
+        try:
+            await set_bot_commands_for_user(target)
+        except Exception as e:
+            logger.warning(f"Cannot refresh commands for {target}: {e}")
+    await own_admins(callback_query, state)
+
+
+# ======================================================================
+# ИТОГИ МАТЧА В КАНАЛ
+# ======================================================================
+async def maybe_post_match_result(lobby_id, force=False):
+    """Публикует итоги матча в канал, когда статистика начислена всем игрокам лобби.
+    force=True — опубликовать с теми, кому статистика уже начислена. Возвращает (опубликовано, причина_отказа)."""
+    if not CHANNEL_ID:
+        return False, "CHANNEL_ID не задан"
+    results = db.get_lobby_match_results(lobby_id)
+    if not results:
+        return False, "По этому лобби ещё нет начисленной статистики"
+    players = db.get_lobby_players(lobby_id)
+    if not force and len(results) < len(players):
+        return False, "Статистика начислена ещё не всем игрокам"
+    lobby_info = db.get_lobby_by_id(lobby_id)
+    if not lobby_info:
+        return False, "Лобби не найдено"
+    if not db.mark_match_posted(lobby_id):
+        return False, "Результаты этого матча уже публиковались"
+
+    medals = ["🥇", "🥈", "🥉"]
+    lines = [
+        f"🏁 Матч #{lobby_info[1]} завершён",
+        f"🎲 Режим: {lobby_info[4]}",
+        f"🗺 Карта: {lobby_info[5]}",
+        "",
+    ]
+    for i, (user_id, nickname, kills, deaths, rating_added) in enumerate(results[:10]):
+        kd = kills / deaths if deaths > 0 else kills
+        place = medals[i] if i < len(medals) else f"{i + 1}."
+        lines.append(f"{place} {strip_tags(display_nickname(user_id, nickname))} — {kills}/{deaths} (K/D {kd:.2f}) · +{rating_added}")
+    lines += ["", f"👥 Игроков: {len(results)}"]
+
+    keyboard = None
+    link = await make_bot_link("join_lobby")
+    if link:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🎮 Играть в боте", url=link)]
+        ])
+    try:
+        await bot.send_message(chat_id=CHANNEL_ID, text="\n".join(lines), reply_markup=keyboard)
+    except Exception as e:
+        db.unmark_match_posted(lobby_id)
+        logger.error(f"Error posting match result for lobby {lobby_id}: {e}")
+        return False, f"Не удалось отправить в канал: {e}"
+    return True, None
+
+
+@dp.message(Command("postmatch"))
+async def cmd_postmatch(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.answer("❌ Нет прав для этой команды.")
+        return
+    lobby_id = db.get_lobby_id_by_topic_thread_id(message.message_thread_id) if message.message_thread_id else None
+    if not lobby_id:
+        await message.answer("❌ Эта команда работает только в теме лобби!")
+        return
+    ok, reason = await maybe_post_match_result(lobby_id, force=True)
+    await message.answer("📣 Результаты матча опубликованы в канале." if ok else f"❌ {reason}")
+
+
 async def cleanup_old_messages():
     try:
         lobby_size = len(user_lobby_messages.cache)
@@ -2646,6 +3291,42 @@ async def cleanup_old_messages():
             logger.info(f"Cache sizes - Lobby: {lobby_size}, Menu: {menu_size}")
     except Exception as e:
         logger.error(f"Error in cleanup_old_messages: {e}")
+
+async def expire_empty_lobbies_once():
+    """Удаляет лобби, в которое за LOBBY_EMPTY_TIMEOUT_MIN минут никто не вступил (кроме создателя)."""
+    expired = db.get_expired_empty_lobbies(LOBBY_EMPTY_TIMEOUT_MIN)
+    for lobby_id, lobby_unique_id, creator_id in expired:
+        try:
+            if len(db.get_lobby_players(lobby_id)) > 1:
+                continue  # кто-то успел вступить
+
+            await delete_lobby_channel_message(lobby_id)
+            success, _, _ = db.delete_lobby(lobby_id)
+            if not success:
+                continue
+            logger.info(f"Lobby {lobby_id} (#{lobby_unique_id}) deleted: nobody joined in {LOBBY_EMPTY_TIMEOUT_MIN} min")
+
+            try:
+                await cleanup_lobby_messages(creator_id)
+                await cleanup_user_messages(creator_id)
+                await send_message_with_image(
+                    creator_id,
+                    f"{pe('⏰')} Лобби #{lobby_unique_id} удалено: за {LOBBY_EMPTY_TIMEOUT_MIN} минут к нему никто не присоединился.",
+                    None,
+                    get_main_keyboard(creator_id)
+                )
+            except Exception as e:
+                logger.warning(f"Cannot notify creator {creator_id} about expired lobby: {e}")
+        except Exception as e:
+            logger.error(f"Error expiring lobby {lobby_id}: {e}")
+
+async def expire_empty_lobbies_loop():
+    while True:
+        try:
+            await expire_empty_lobbies_once()
+        except Exception as e:
+            logger.error(f"Error in expire_empty_lobbies_loop: {e}")
+        await asyncio.sleep(60)
 
 async def main():
     commands = [
@@ -2662,11 +3343,14 @@ async def main():
     print("Бот запущен...")
     logger.info("Bot starting...")
 
+    expiry_task = asyncio.create_task(expire_empty_lobbies_loop())
+
     try:
         await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Error in main: {e}")
     finally:
+        expiry_task.cancel()
         await bot.session.close()
 
 if __name__ == "__main__":
