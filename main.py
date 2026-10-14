@@ -42,6 +42,8 @@ from aiogram.types import (
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage
+from decimal import Decimal, ROUND_HALF_UP
 from aiogram.exceptions import TelegramBadRequest
 from dotenv import load_dotenv
 from database import Database
@@ -93,9 +95,24 @@ PREMIUM_PRICE_USD_30 = '1.01'
 PREMIUM_PRICE_USD_90 = '2.02'
 PREMIUM_STARS_30 = 29
 PREMIUM_STARS_90 = 49
+PROMO_PREMIUM_BONUS_RATING = 100  # бонус к рейтингу за Premium по промокоду (как при покупке)
+FIRST_PURCHASE_DISCOUNT_PERCENT = max(0, min(90, _env_int('FIRST_PURCHASE_DISCOUNT_PERCENT', 20)))  # скидка на первую покупку, %
 
 pending_cryptobot_invoices = {}
-pending_lobby_join = {}  # user_id -> lobby_id (человек пришёл по ссылке из канала, но ещё не зарегистрирован)
+
+def set_pending_lobby_join(user_id, lobby_id):
+    """Человек пришёл по ссылке из канала, но ещё не зарегистрирован: запоминаем лобби (в базе, переживает перезапуск)."""
+    db.kv_set(f"pending_join:{user_id}", lobby_id)
+
+def pop_pending_lobby_join(user_id):
+    value = db.kv_get(f"pending_join:{user_id}")
+    if value is None:
+        return None
+    db.kv_delete(f"pending_join:{user_id}")
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 # ---- PREMIUM EMOJI ----
 # Ключ = сам эмодзи (fallback), значение = (emoji_id, fallback).
@@ -209,10 +226,47 @@ def btn(text: str, callback_data: str = None, url: str = None, icon: str = None)
 if not BOT_TOKEN:
     raise ValueError("BOT_TOKEN не найден в .env файле")
 
+class PostgresFSMStorage(BaseStorage):
+    """Хранит состояния диалогов (регистрация, создание лобби и т.д.) в базе: перезапуск бота их не сбрасывает."""
+
+    def __init__(self, database):
+        self.database = database
+
+    @staticmethod
+    def _key(key):
+        return (
+            f"{key.bot_id}:{key.chat_id}:{key.user_id}:"
+            f"{getattr(key, 'thread_id', None) or 0}:{getattr(key, 'destiny', 'default')}"
+        )
+
+    async def set_state(self, key, state=None):
+        value = state.state if isinstance(state, State) else state
+        self.database.fsm_set_state(self._key(key), value)
+
+    async def get_state(self, key):
+        return self.database.fsm_get(self._key(key))[0]
+
+    async def set_data(self, key, data):
+        self.database.fsm_set_data(self._key(key), json.dumps(dict(data), ensure_ascii=False, default=str))
+
+    async def get_data(self, key):
+        try:
+            return json.loads(self.database.fsm_get(self._key(key))[1] or "{}")
+        except ValueError:
+            return {}
+
+    async def close(self):
+        pass
+
+
 bot = Bot(token=BOT_TOKEN)
-storage = MemoryStorage()
-dp = Dispatcher(storage=storage)
 db = Database()
+try:
+    storage = PostgresFSMStorage(db)
+except Exception as _storage_error:
+    logger.error(f"FSM storage in database unavailable, using memory: {_storage_error}")
+    storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 from collections import OrderedDict
 
@@ -391,10 +445,19 @@ def get_edit_profile_keyboard():
         [btn("◀️ К профилю", callback_data="profile", icon="◀️")],
     ])
 
-def get_premium_period_keyboard():
+def get_premium_period_keyboard(user_id=None):
+    label_30 = "🗓 30 days — $1.01"
+    label_90 = "📆 90 days — $2.02"
+    if user_id:
+        label_30 = f"🗓 30 days — {price_button_label(user_id, PREMIUM_30_DAYS)}"
+        label_90 = f"📆 90 days — {price_button_label(user_id, PREMIUM_90_DAYS)}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [btn("🗓 30 days — $1.00", callback_data="premium_pick_30", icon="🗓")],
-        [btn("📆 90 days — $2.00", callback_data="premium_pick_90", icon="📆")],
+        [btn(label_30, callback_data="premium_pick_30", icon="🗓")],
+        [btn(label_90, callback_data="premium_pick_90", icon="📆")],
+        [
+            btn("🎟 Промокод", callback_data="promo_enter", icon="🎟"),
+            btn("🎁 Подарить Premium", callback_data="gift_start", icon="🎁"),
+        ],
         [btn("◀️ Назад", callback_data="back_to_main", icon="◀️")],
     ])
 
@@ -586,6 +649,9 @@ def get_lobby_actions_keyboard(lobby_id, user_id, is_creator=False, players_coun
                 buttons.append([btn("✅ Присоединиться", callback_data=f"join_lobby_{lobby_id}", icon="✅")])
 
         buttons.append([btn("🔄 Обновить", callback_data=f"view_lobby_{lobby_id}", icon="🔄")])
+
+        if is_admin(user_id) and not is_creator:
+            buttons.append([btn("🗑 Удалить лобби (админ)", callback_data=f"delete_lobby_{lobby_id}", icon="🗑")])
 
     if not lobby_full:
         buttons.append([btn("◀️ Назад к списку", callback_data="active_lobbies", icon="◀️")])
@@ -1094,7 +1160,8 @@ async def send_broadcast_message(user_id, text, parse_mode=None):
         return False
 
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     user_id = message.from_user.id
     first_name = message.from_user.first_name
 
@@ -1113,7 +1180,7 @@ async def cmd_start(message: types.Message):
             if db.is_user_registered(user_id):
                 await join_lobby_from_link(message.chat.id, user_id, link_lobby_id)
             else:
-                pending_lobby_join[user_id] = link_lobby_id
+                set_pending_lobby_join(user_id, link_lobby_id)
                 await message.answer(
                     f"{pe('👋')} Привет, {esc(first_name)}!\n\nДля участия в лобби нужно зарегистрироваться. "
                     f"После регистрации я сразу добавлю вас в лобби:",
@@ -1850,12 +1917,15 @@ async def delete_lobby(callback_query: types.CallbackQuery):
         user_id = callback_query.from_user.id
 
         lobby_info = db.get_lobby_by_id(lobby_id)
-        if not lobby_info or lobby_info[2] != user_id:
+        deleted_by_admin = bool(lobby_info) and lobby_info[2] != user_id and is_admin(user_id)
+        if not lobby_info or (lobby_info[2] != user_id and not deleted_by_admin):
             await callback_query.answer("❌ Вы не можете удалить это лобби", show_alert=True)
             return
 
         players = db.get_lobby_players(lobby_id)
         lobby_unique_id = lobby_info[1]
+        lobby_creator_id = lobby_info[2]
+        deleted_by_text = "администратором" if deleted_by_admin else "хостером"
 
         await delete_lobby_channel_message(lobby_id)
 
@@ -1871,7 +1941,7 @@ async def delete_lobby(callback_query: types.CallbackQuery):
 
                     await bot.send_message(
                         chat_id=player_id,
-                        text=f"{pe('❌')} Лобби #{lobby_unique_id} было удалено хостером!",
+                        text=f"{pe('❌')} Лобби #{lobby_unique_id} было удалено {deleted_by_text}!",
                         parse_mode='HTML'
                     )
 
@@ -1897,6 +1967,16 @@ async def delete_lobby(callback_query: types.CallbackQuery):
 
             await cleanup_lobby_messages(user_id)
             await cleanup_user_messages(user_id)
+
+            if deleted_by_admin:
+                db.log_admin_action(user_id, "delete_lobby", lobby_creator_id, f"lobby #{lobby_unique_id}")
+                if user_id not in [p[0] for p in players]:
+                    await send_message_with_image(
+                        user_id,
+                        f"{pe('✅')} Лобби #{lobby_unique_id} удалено.",
+                        None,
+                        get_main_keyboard(user_id)
+                    )
 
         else:
             await callback_query.answer("❌ Ошибка при удалении лобби", show_alert=True)
@@ -2111,7 +2191,7 @@ async def process_game_id(message: types.Message, state: FSMContext):
         menu_text = f"{pe('✅')} Регистрация завершена!\n\n{pe('👋')} Добро пожаловать, {nickname}!\n\nВыберите действие:"
         await send_message_with_image(message.chat.id, menu_text, MENU_IMAGE_URL, get_main_keyboard(user_id))
 
-        pending_lobby_id = pending_lobby_join.pop(user_id, None)
+        pending_lobby_id = pop_pending_lobby_join(user_id)
         if pending_lobby_id is not None:
             try:
                 await join_lobby_from_link(message.chat.id, user_id, pending_lobby_id)
@@ -2124,7 +2204,7 @@ async def process_game_id(message: types.Message, state: FSMContext):
 async def cancel_registration(callback_query: types.CallbackQuery, state: FSMContext):
     await state.clear()
     user_id = callback_query.from_user.id
-    pending_lobby_join.pop(user_id, None)
+    pop_pending_lobby_join(user_id)
     first_name = callback_query.from_user.first_name
 
     await cleanup_user_messages(user_id)
@@ -2420,20 +2500,82 @@ async def show_all_time_top(callback_query: types.CallbackQuery):
     await send_message_with_image(user_id, top_text, TOP_IMAGE_URL, get_top_keyboard())
     await callback_query.answer()
 
+# ======================================================================
+# PREMIUM: цены и скидки, промокоды, подарки, оплата (заказы хранятся в базе)
+# ======================================================================
+class PromoStates(StatesGroup):
+    waiting_for_code = State()
+
+
+class GiftStates(StatesGroup):
+    waiting_for_recipient = State()
+
+
+def compute_price(user_id, days):
+    """Цена для конкретного покупателя с учётом скидки (первая покупка / активированный промокод).
+    Скидки не складываются: берётся лучшая."""
+    base_usd = Decimal(PREMIUM_PRICE_USD_30 if days == PREMIUM_30_DAYS else PREMIUM_PRICE_USD_90)
+    base_stars = PREMIUM_STARS_30 if days == PREMIUM_30_DAYS else PREMIUM_STARS_90
+    percent, reason, promo_code = 0, None, None
+    if FIRST_PURCHASE_DISCOUNT_PERCENT > 0 and not db.has_paid_premium(user_id):
+        percent, reason = FIRST_PURCHASE_DISCOUNT_PERCENT, "первая покупка"
+    promo = db.get_best_pending_promo_discount(user_id)
+    if promo and promo[1] > percent:
+        promo_code, percent, reason = promo[0], promo[1], f"промокод {promo[0]}"
+    factor = Decimal(100 - percent) / Decimal(100)
+    usd = max(Decimal("0.01"), (base_usd * factor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+    stars = max(1, int((Decimal(base_stars) * factor).to_integral_value(rounding=ROUND_HALF_UP)))
+    return {
+        "usd": usd, "stars": stars, "base_usd": base_usd, "base_stars": base_stars,
+        "percent": percent, "reason": reason, "promo_code": promo_code,
+    }
+
+
+def price_button_label(user_id, days):
+    p = compute_price(user_id, days)
+    label = f"${p['usd']}"
+    if p["percent"]:
+        label += f" (−{p['percent']}%)"
+    return label
+
+
+def player_nick(user_id):
+    p = db.get_player_profile(user_id)
+    return p[2] if p else str(user_id)
+
+
+def premium_payment_text(uid, days, recipient_id=None):
+    price = compute_price(uid, days)
+    lines = [f"{pe('🛒')} Покупка: Premium Status ({days} дней)"]
+    if recipient_id and recipient_id != uid:
+        lines.append(f"🎁 Подарок для: {esc(player_nick(recipient_id))}")
+    lines.append(f"{pe('💵')} Цена: ${price['usd']} / {price['stars']} Stars (звёзды в Telegram)")
+    if price["percent"]:
+        lines.append(
+            f"🎁 Скидка {price['percent']}% ({esc(price['reason'])}). "
+            f"Без скидки: ${price['base_usd']} / {price['base_stars']} Stars"
+        )
+    lines += ["", "Выберите способ оплаты:"]
+    return "\n".join(lines)
+
+
+async def send_premium_menu(uid):
+    await cleanup_user_messages(uid)
+    caption = f"{pe('🌟')} <b>Premium Status</b>\n\nНа сколько ты хочешь купить подписку?"
+    p = compute_price(uid, PREMIUM_30_DAYS)
+    if p["percent"]:
+        caption += f"\n\n🎁 Ваша скидка: {p['percent']}% ({esc(p['reason'])})"
+    await send_message_with_image(uid, caption, PREMIUM_IMAGE_URL, get_premium_period_keyboard(uid))
+
+
 @dp.callback_query(lambda c: c.data == "premium_menu")
-async def premium_menu(callback_query: types.CallbackQuery):
+async def premium_menu(callback_query: types.CallbackQuery, state: FSMContext):
     uid = callback_query.from_user.id
     if not db.is_user_registered(uid):
         await callback_query.answer("Сначала зарегистрируйтесь в боте.", show_alert=True)
         return
-    await cleanup_user_messages(uid)
-    caption = f"{pe('🌟')} <b>Premium Status</b>\n\nНа сколько ты хочешь купить подписку?"
-    await send_message_with_image(
-        uid,
-        caption,
-        PREMIUM_IMAGE_URL,
-        get_premium_period_keyboard(),
-    )
+    await state.clear()
+    await send_premium_menu(uid)
     await callback_query.answer()
 
 
@@ -2444,31 +2586,39 @@ async def premium_pick_period(callback_query: types.CallbackQuery):
         await callback_query.answer("Сначала зарегистрируйтесь.", show_alert=True)
         return
     days = PREMIUM_30_DAYS if callback_query.data.endswith("30") else PREMIUM_90_DAYS
-    usd = PREMIUM_PRICE_USD_30 if days == 30 else PREMIUM_PRICE_USD_90
-    stars = PREMIUM_STARS_30 if days == 30 else PREMIUM_STARS_90
-    text = (
-        f"{pe('🛒')} Покупка: Premium Status ({days} дней)\n"
-        f"{pe('💵')} Цена: ${usd} / {stars} Stars (звёзды в Telegram)\n\n"
-        f"Выберите способ оплаты:"
-    )
     await cleanup_user_messages(uid)
-    await send_message_with_image(uid, text, None, get_premium_payment_keyboard(days))
+    await send_message_with_image(uid, premium_payment_text(uid, days), None, get_premium_payment_keyboard(days))
     await callback_query.answer()
 
 
-@dp.callback_query(lambda c: c.data.startswith("premium_pay_crypto_"))
-async def premium_pay_crypto(callback_query: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data.startswith("premium_pick_back_"))
+async def premium_pick_back(callback_query: types.CallbackQuery):
     uid = callback_query.from_user.id
-    if not db.is_user_registered(uid):
-        await callback_query.answer("Сначала зарегистрируйтесь.", show_alert=True)
-        return
     try:
-        days = int(callback_query.data.replace("premium_pay_crypto_", ""))
+        days = int(callback_query.data.replace("premium_pick_back_", ""))
     except ValueError:
         await callback_query.answer()
         return
     if days not in (PREMIUM_30_DAYS, PREMIUM_90_DAYS):
         await callback_query.answer()
+        return
+    await cleanup_user_messages(uid)
+    await send_message_with_image(uid, premium_payment_text(uid, days), None, get_premium_payment_keyboard(days))
+    await callback_query.answer()
+
+
+# ---------- оплата: общие функции ----------
+async def start_crypto_payment(callback_query, days, recipient_id=None):
+    uid = callback_query.from_user.id
+    recipient_id = recipient_id or uid
+    if not db.is_user_registered(uid):
+        await callback_query.answer("Сначала зарегистрируйтесь.", show_alert=True)
+        return
+    if days not in (PREMIUM_30_DAYS, PREMIUM_90_DAYS):
+        await callback_query.answer()
+        return
+    if recipient_id != uid and not db.is_user_registered(recipient_id):
+        await callback_query.answer("Получатель не найден.", show_alert=True)
         return
     if not CRYPTOBOT_TOKEN:
         await callback_query.answer(
@@ -2476,11 +2626,17 @@ async def premium_pay_crypto(callback_query: types.CallbackQuery):
             show_alert=True,
         )
         return
-    usd = PREMIUM_PRICE_USD_30 if days == 30 else PREMIUM_PRICE_USD_90
+    price = compute_price(uid, days)
+    order_id = db.create_premium_order(
+        "cryptobot", uid, recipient_id, days, price["usd"], price["stars"], price["percent"], price["promo_code"]
+    )
+    if not order_id:
+        await callback_query.answer("Не удалось создать заказ, попробуйте позже.", show_alert=True)
+        return
     body = {
         "currency_type": "fiat",
         "fiat": "USD",
-        "amount": str(usd),
+        "amount": str(price["usd"]),
         "description": f"Premium Status {days} дней",
         "expires_in": 600,
     }
@@ -2493,52 +2649,196 @@ async def premium_pay_crypto(callback_query: types.CallbackQuery):
     if not pay_url or invoice_id is None:
         await callback_query.answer("Не удалось создать счёт CryptoBot.", show_alert=True)
         return
-    pending_cryptobot_invoices[uid] = {"invoice_id": int(invoice_id), "days": days}
+    db.set_order_invoice(order_id, invoice_id)
+    back_cb = f"premium_pick_back_{days}" if recipient_id == uid else f"gift_pick_{recipient_id}_{days}"
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [btn("💲 Оплатить в CryptoBot", url=pay_url, icon="💲")],
-            [
-                btn(
-                    "🔍 Проверить оплату",
-                    callback_data=f"premium_cbcheck:{invoice_id}:{uid}:{days}",
-                    icon="🔍"
-                )
-            ],
-            [btn("◀️ Назад", callback_data=f"premium_pick_back_{days}", icon="◀️")],
+            [btn("🔍 Проверить оплату", callback_data=f"pcheck_{order_id}", icon="🔍")],
+            [btn("◀️ Назад", callback_data=back_cb, icon="◀️")],
         ]
     )
+    lines = [f"{pe('🌟')} Оплата Premium Status ({days} д.)"]
+    if recipient_id != uid:
+        lines.append(f"🎁 Подарок для: {esc(player_nick(recipient_id))}")
+    lines.append(f"{pe('💲')} Сумма: ${price['usd']}")
+    lines += ["", f"{pe('⚠️')} У вас 10 минут на оплату."]
     await cleanup_user_messages(uid)
-    await bot.send_message(
-        chat_id=uid,
-        text=(
-            f"{pe('🌟')} Оплата Premium Status ({days} д.)\n"
-            f"{pe('💲')} Сумма: ${usd}\n\n"
-            f"{pe('⚠️')} У вас 10 минут на оплату."
-        ),
-        reply_markup=kb,
-        parse_mode='HTML'
-    )
+    await bot.send_message(chat_id=uid, text="\n".join(lines), reply_markup=kb, parse_mode='HTML')
     await callback_query.answer()
 
 
-@dp.callback_query(lambda c: c.data.startswith("premium_pick_back_"))
-async def premium_pick_back(callback_query: types.CallbackQuery):
+async def start_stars_payment(callback_query, days, recipient_id=None):
     uid = callback_query.from_user.id
+    recipient_id = recipient_id or uid
+    if not db.is_user_registered(uid):
+        await callback_query.answer("Сначала зарегистрируйтесь.", show_alert=True)
+        return
+    if days not in (PREMIUM_30_DAYS, PREMIUM_90_DAYS):
+        await callback_query.answer()
+        return
+    if recipient_id != uid and not db.is_user_registered(recipient_id):
+        await callback_query.answer("Получатель не найден.", show_alert=True)
+        return
+    price = compute_price(uid, days)
+    order_id = db.create_premium_order(
+        "telegram_stars", uid, recipient_id, days, price["usd"], price["stars"], price["percent"], price["promo_code"]
+    )
+    if not order_id:
+        await callback_query.answer("Не удалось создать заказ, попробуйте позже.", show_alert=True)
+        return
+    description = (
+        f"Подписка Premium на {days} дней"
+        if recipient_id == uid
+        else f"Подарок: Premium на {days} дней для {player_nick(recipient_id)}"
+    )
     try:
-        days = int(callback_query.data.replace("premium_pick_back_", ""))
+        await bot.send_invoice(
+            chat_id=uid,
+            title="Premium Status",
+            description=description[:250],
+            payload=f"order_{order_id}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"Premium {days} дней", amount=price["stars"])],
+            provider_token="",
+        )
+    except Exception as e:
+        logger.error(f"send_invoice stars: {e}")
+        await callback_query.answer("Не удалось выставить счёт Stars.", show_alert=True)
+        return
+    await callback_query.answer()
+
+
+async def finalize_premium_order(order, provider_ref):
+    """Выдаёт Premium получателю по оплаченному заказу. Идемпотентно по provider_ref."""
+    (order_id, provider, _, _, buyer_id, recipient_id, days, _, _, _, promo_code, _) = order
+    granted = db.try_register_premium_payment(recipient_id, days, provider, provider_ref)
+    if not granted:
+        return False
+    db.mark_order_paid(order_id, provider_ref)
+    if promo_code:
+        db.mark_promo_applied(buyer_id, promo_code, order_id)
+    try:
+        chat = await bot.get_chat(buyer_id)
+        un = chat.username or ""
+        line_user = f"{buyer_id} | @{un}" if un else f"{buyer_id} |"
+        if recipient_id == buyer_id:
+            log_text = (
+                f"{line_user}\n"
+                f"Купил премиум на {days} дней!\n"
+                f"Не забудьте выдать покупателю доступ в приватный чат и префикс в чате!\n"
+                f"@uglymatthey"
+            )
+        else:
+            log_text = (
+                f"{line_user}\n"
+                f"Подарил премиум на {days} дней игроку {player_nick(recipient_id)} ({recipient_id})!\n"
+                f"Не забудьте выдать получателю доступ в приватный чат и префикс в чате!\n"
+                f"@uglymatthey"
+            )
+        if PREMIUM_LOG_CHAT_ID:
+            await bot.send_message(chat_id=int(PREMIUM_LOG_CHAT_ID), text=log_text)
+    except Exception as e:
+        logger.error(f"finalize_premium_order log chat: {e}")
+    if recipient_id != buyer_id:
+        try:
+            await bot.send_message(
+                chat_id=recipient_id,
+                text=(
+                    f"{pe('🎁')} Игрок {esc(player_nick(buyer_id))} подарил вам Premium на {days} дней!\n"
+                    f"{pe('⭐️')} Приятной игры!"
+                ),
+                parse_mode='HTML',
+            )
+        except Exception as e:
+            logger.info(f"Cannot notify gift recipient {recipient_id}: {e}")
+    return True
+
+
+async def after_order_paid(chat_id, order, first_name):
+    buyer_id, recipient_id, days = order[4], order[5], order[6]
+    if recipient_id == buyer_id:
+        await show_post_purchase_main_menu(chat_id, buyer_id, first_name, days)
+    else:
+        await cleanup_user_messages(buyer_id)
+        await send_message_with_image(
+            chat_id,
+            f"{pe('🎁')} Подарок отправлен! Игрок {esc(player_nick(recipient_id))} получил Premium на {days} дней.",
+            MENU_IMAGE_URL,
+            get_main_keyboard(buyer_id),
+        )
+
+
+@dp.callback_query(lambda c: c.data.startswith("premium_pay_crypto_"))
+async def premium_pay_crypto(callback_query: types.CallbackQuery):
+    try:
+        days = int(callback_query.data.replace("premium_pay_crypto_", ""))
     except ValueError:
         await callback_query.answer()
         return
-    usd = PREMIUM_PRICE_USD_30 if days == 30 else PREMIUM_PRICE_USD_90
-    stars = PREMIUM_STARS_30 if days == 30 else PREMIUM_STARS_90
-    text = (
-        f"{pe('🛒')} Покупка: Premium Status ({days} дней)\n"
-        f"{pe('💵')} Цена: ${usd} / {stars} Stars (звёзды в Telegram)\n\n"
-        f"Выберите способ оплаты:"
-    )
-    await cleanup_user_messages(uid)
-    await send_message_with_image(uid, text, None, get_premium_payment_keyboard(days))
-    await callback_query.answer()
+    await start_crypto_payment(callback_query, days)
+
+
+@dp.callback_query(lambda c: c.data.startswith("premium_pay_stars_"))
+async def premium_pay_stars(callback_query: types.CallbackQuery):
+    try:
+        days = int(callback_query.data.replace("premium_pay_stars_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    await start_stars_payment(callback_query, days)
+
+
+@dp.callback_query(lambda c: c.data.startswith("pcheck_"))
+async def premium_order_check(callback_query: types.CallbackQuery):
+    try:
+        order_id = int(callback_query.data.replace("pcheck_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    uid = callback_query.from_user.id
+    order = db.get_premium_order(order_id)
+    if not order or order[4] != uid:
+        await callback_query.answer("Это не ваш счёт.", show_alert=True)
+        return
+    _, provider, _, invoice_id, _, _, days, price_usd, _, _, _, status = order
+    if status == "paid":
+        await callback_query.answer("Платёж уже был учтён.", show_alert=True)
+        return
+    if provider != "cryptobot" or not invoice_id:
+        await callback_query.answer("Счёт не найден. Создайте новый из меню Premium.", show_alert=True)
+        return
+    inv, err = await asyncio.to_thread(cryptobot_get_invoice, invoice_id)
+    if err or not inv:
+        await callback_query.answer(f"Ошибка: {err or 'счёт не найден'}", show_alert=True)
+        return
+    inv_status = inv.get("status")
+    if inv_status == "expired":
+        await callback_query.answer("Счёт истёк. Создайте новый из меню Premium.", show_alert=True)
+        return
+    if inv_status != "paid":
+        await callback_query.answer("Оплата ещё не поступила.", show_alert=True)
+        return
+    try:
+        amount_ok = Decimal(str(inv.get("amount"))).quantize(Decimal("0.01")) == Decimal(str(price_usd)).quantize(Decimal("0.01"))
+        if inv.get("currency_type") == "fiat" and inv.get("fiat") != "USD":
+            amount_ok = False
+    except Exception:
+        amount_ok = False
+    if not amount_ok:
+        logger.warning(f"CryptoBot invoice {invoice_id}: amount mismatch: {inv.get('amount')} {inv.get('fiat')} vs {price_usd}")
+        await callback_query.answer("Сумма счёта не совпадает с заказом.", show_alert=True)
+        return
+    ok = await finalize_premium_order(order, f"cryptobot_{invoice_id}")
+    if ok:
+        try:
+            await callback_query.message.delete()
+        except Exception:
+            pass
+        await after_order_paid(callback_query.message.chat.id, order, callback_query.from_user.first_name)
+        await callback_query.answer()
+    else:
+        await callback_query.answer("Платёж уже был учтён.", show_alert=True)
 
 
 @dp.callback_query(lambda c: c.data.startswith("premium_cbcheck:"))
@@ -2601,42 +2901,30 @@ async def premium_cryptobot_check(callback_query: types.CallbackQuery):
         await callback_query.answer("Платёж уже был учтён.", show_alert=True)
 
 
-@dp.callback_query(lambda c: c.data.startswith("premium_pay_stars_"))
-async def premium_pay_stars(callback_query: types.CallbackQuery):
-    uid = callback_query.from_user.id
-    if not db.is_user_registered(uid):
-        await callback_query.answer("Сначала зарегистрируйтесь.", show_alert=True)
-        return
-    try:
-        days = int(callback_query.data.replace("premium_pay_stars_", ""))
-    except ValueError:
-        await callback_query.answer()
-        return
-    if days not in (PREMIUM_30_DAYS, PREMIUM_90_DAYS):
-        await callback_query.answer()
-        return
-    stars = PREMIUM_STARS_30 if days == 30 else PREMIUM_STARS_90
-    try:
-        await bot.send_invoice(
-            chat_id=uid,
-            title="Premium Status",
-            description=f"Подписка Premium на {days} дней",
-            payload=f"premium_stars_{days}",
-            currency="XTR",
-            prices=[LabeledPrice(label=f"Premium {days} дней", amount=stars)],
-            provider_token="",
-        )
-    except Exception as e:
-        logger.error(f"send_invoice stars: {e}")
-        await callback_query.answer("Не удалось выставить счёт Stars.", show_alert=True)
-        return
-    await callback_query.answer()
-
-
 @dp.pre_checkout_query()
 async def pre_checkout_handler(pre_checkout_query: types.PreCheckoutQuery):
     payload = pre_checkout_query.invoice_payload or ""
-    if payload.startswith("premium_stars_"):
+    if payload.startswith("order_"):
+        ok = False
+        try:
+            order = db.get_premium_order(int(payload.replace("order_", "")))
+            ok = bool(
+                order
+                and order[11] == "pending"
+                and order[1] == "telegram_stars"
+                and order[4] == pre_checkout_query.from_user.id
+                and order[8] == pre_checkout_query.total_amount
+            )
+        except Exception as e:
+            logger.error(f"pre_checkout order: {e}")
+        if ok:
+            await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+        else:
+            await bot.answer_pre_checkout_query(
+                pre_checkout_query.id, ok=False, error_message="Заказ не найден или цена изменилась. Создайте счёт заново."
+            )
+    elif payload.startswith("premium_stars_"):
+        # счета, выставленные до обновления
         await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
     else:
         await bot.answer_pre_checkout_query(
@@ -2646,12 +2934,56 @@ async def pre_checkout_handler(pre_checkout_query: types.PreCheckoutQuery):
         )
 
 
+async def log_stars_failure(uid, days, charge_id):
+    try:
+        if PREMIUM_LOG_CHAT_ID:
+            await bot.send_message(
+                chat_id=int(PREMIUM_LOG_CHAT_ID),
+                text=(
+                    "⚠️ Платёж Stars не активирован автоматически.\n"
+                    f"user_id: {uid}\n"
+                    f"Дней: {days}\n"
+                    f"charge_id: {charge_id}\n"
+                    "Возможно, это повтор уже учтённого платежа — проверьте вручную."
+                ),
+            )
+    except Exception as e:
+        logger.error(f"stars failure log: {e}")
+
+
 @dp.message(F.successful_payment)
 async def on_successful_payment(message: types.Message):
     sp = message.successful_payment
     if not sp:
         return
     payload = sp.invoice_payload or ""
+    uid = message.from_user.id
+
+    if payload.startswith("order_"):
+        try:
+            order = db.get_premium_order(int(payload.replace("order_", "")))
+        except ValueError:
+            order = None
+        if not order:
+            await log_stars_failure(uid, "?", sp.telegram_payment_charge_id)
+            await message.answer("Не удалось найти заказ. Напишите администратору, мы всё проверим.")
+            return
+        ok = await finalize_premium_order(order, f"stars_{sp.telegram_payment_charge_id}")
+        if not ok:
+            await log_stars_failure(uid, order[6], sp.telegram_payment_charge_id)
+            await message.answer(
+                "Не удалось активировать Premium (возможно, платёж уже учтён). "
+                "Если Premium не появился, напишите администратору."
+            )
+            return
+        try:
+            await message.delete()
+        except Exception:
+            pass
+        await after_order_paid(message.chat.id, order, message.from_user.first_name)
+        return
+
+    # счета Stars, выставленные до обновления
     if not payload.startswith("premium_stars_"):
         return
     try:
@@ -2660,24 +2992,10 @@ async def on_successful_payment(message: types.Message):
         return
     if days not in (PREMIUM_30_DAYS, PREMIUM_90_DAYS):
         return
-    uid = message.from_user.id
     ref = f"stars_{sp.telegram_payment_charge_id}"
     ok = await finalize_premium_purchase(uid, days, "telegram_stars", ref)
     if not ok:
-        try:
-            if PREMIUM_LOG_CHAT_ID:
-                await bot.send_message(
-                    chat_id=int(PREMIUM_LOG_CHAT_ID),
-                    text=(
-                        "⚠️ Платёж Stars не активирован автоматически.\n"
-                        f"user_id: {uid}\n"
-                        f"Дней: {days}\n"
-                        f"charge_id: {sp.telegram_payment_charge_id}\n"
-                        "Возможно, это повтор уже учтённого платежа — проверьте вручную."
-                    ),
-                )
-        except Exception as e:
-            logger.error(f"stars failure log: {e}")
+        await log_stars_failure(uid, days, sp.telegram_payment_charge_id)
         await message.answer(
             "Не удалось активировать Premium (возможно, платёж уже учтён). "
             "Если Premium не появился, напишите администратору."
@@ -2690,6 +3008,184 @@ async def on_successful_payment(message: types.Message):
     await show_post_purchase_main_menu(
         message.chat.id, uid, message.from_user.first_name, days
     )
+
+
+# ---------- промокоды (сторона игрока) ----------
+def promo_back_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[[btn("◀️ Назад", callback_data="premium_menu", icon="◀️")]])
+
+
+@dp.callback_query(lambda c: c.data == "promo_enter")
+async def promo_enter(callback_query: types.CallbackQuery, state: FSMContext):
+    uid = callback_query.from_user.id
+    if not db.is_user_registered(uid):
+        await callback_query.answer("Сначала зарегистрируйтесь.", show_alert=True)
+        return
+    await state.set_state(PromoStates.waiting_for_code)
+    await cleanup_user_messages(uid)
+    await send_message_with_image(uid, f"{pe('🎟')} Введите промокод:", None, promo_back_keyboard())
+    await callback_query.answer()
+
+
+@dp.message(PromoStates.waiting_for_code)
+async def promo_code_entered(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    code = (message.text or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,20}", code):
+        await message.answer("❌ Промокод состоит из букв, цифр, «-» и «_» (3-20 символов). Попробуйте ещё раз.", reply_markup=promo_back_keyboard())
+        return
+    kind, value, err = db.redeem_promo(uid, code)
+    if err:
+        await message.answer(f"❌ {err}", reply_markup=promo_back_keyboard())
+        return
+    await state.clear()
+    if kind == "days":
+        new_until = db.grant_premium_days(
+            uid, value, provider="promo", ref=f"promo_{code}_{uid}", bonus_rating=PROMO_PREMIUM_BONUS_RATING
+        )
+        if not new_until:
+            db.cancel_promo_redemption(uid, code)
+            await message.answer("❌ Не удалось начислить Premium, попробуйте ещё раз позже.")
+            return
+        await message.answer(
+            f"🎉 Промокод активирован! Вам начислено {value} дн. Premium (до {fmt_dt(new_until)}) "
+            f"и +{PROMO_PREMIUM_BONUS_RATING} рейтинга."
+        )
+        try:
+            chat = await bot.get_chat(uid)
+            un = chat.username or ""
+            line_user = f"{uid} | @{un}" if un else f"{uid} |"
+            if PREMIUM_LOG_CHAT_ID:
+                await bot.send_message(
+                    chat_id=int(PREMIUM_LOG_CHAT_ID),
+                    text=(
+                        f"{line_user}\n"
+                        f"Активировал промокод {code}: Premium на {value} дней!\n"
+                        f"Не забудьте выдать доступ в приватный чат и префикс в чате!\n"
+                        f"@uglymatthey"
+                    ),
+                )
+        except Exception as e:
+            logger.error(f"promo premium log chat: {e}")
+    else:
+        await message.answer(f"✅ Промокод активирован: скидка {value}% на следующую покупку Premium.")
+    await send_premium_menu(uid)
+
+
+# ---------- подарок Premium другому игроку ----------
+@dp.callback_query(lambda c: c.data == "gift_start")
+async def gift_start(callback_query: types.CallbackQuery, state: FSMContext):
+    uid = callback_query.from_user.id
+    if not db.is_user_registered(uid):
+        await callback_query.answer("Сначала зарегистрируйтесь.", show_alert=True)
+        return
+    await state.set_state(GiftStates.waiting_for_recipient)
+    await cleanup_user_messages(uid)
+    await send_message_with_image(
+        uid,
+        f"{pe('🎁')} Кому подарить Premium?\n\n"
+        "Отправьте ник, @username или Telegram ID игрока. Он должен быть зарегистрирован в боте.",
+        None,
+        promo_back_keyboard(),
+    )
+    await callback_query.answer()
+
+
+async def show_gift_periods(uid, recipient_id):
+    await cleanup_user_messages(uid)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [btn(f"🗓 30 days — {price_button_label(uid, PREMIUM_30_DAYS)}", callback_data=f"gift_pick_{recipient_id}_30", icon="🗓")],
+        [btn(f"📆 90 days — {price_button_label(uid, PREMIUM_90_DAYS)}", callback_data=f"gift_pick_{recipient_id}_90", icon="📆")],
+        [btn("◀️ Назад", callback_data="premium_menu", icon="◀️")],
+    ])
+    await send_message_with_image(
+        uid,
+        f"{pe('🎁')} Подарок для: {esc(player_nick(recipient_id))}\n\nНа сколько подарить Premium?",
+        None,
+        kb,
+    )
+
+
+@dp.message(GiftStates.waiting_for_recipient)
+async def gift_recipient_entered(message: types.Message, state: FSMContext):
+    uid = message.from_user.id
+    target = db.find_player_id(message.text or "")
+    if not target:
+        await message.answer("❌ Игрок не найден. Проверьте ник, @username или Telegram ID.", reply_markup=promo_back_keyboard())
+        return
+    if target == uid:
+        await message.answer("Для себя Premium покупается в обычном меню. Отправьте ник друга.", reply_markup=promo_back_keyboard())
+        return
+    await state.clear()
+    await show_gift_periods(uid, target)
+
+
+@dp.callback_query(lambda c: c.data.startswith("gift_to_"))
+async def gift_to(callback_query: types.CallbackQuery):
+    uid = callback_query.from_user.id
+    try:
+        target = int(callback_query.data.replace("gift_to_", ""))
+    except ValueError:
+        await callback_query.answer()
+        return
+    if not db.is_user_registered(uid) or not db.is_user_registered(target) or target == uid:
+        await callback_query.answer("Получатель недоступен.", show_alert=True)
+        return
+    await show_gift_periods(uid, target)
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("gift_pick_"))
+async def gift_pick(callback_query: types.CallbackQuery):
+    uid = callback_query.from_user.id
+    try:
+        _, _, target_s, days_s = callback_query.data.split("_")
+        target, days = int(target_s), int(days_s)
+    except ValueError:
+        await callback_query.answer()
+        return
+    if days not in (PREMIUM_30_DAYS, PREMIUM_90_DAYS) or not db.is_user_registered(uid) \
+            or not db.is_user_registered(target) or target == uid:
+        await callback_query.answer("Получатель недоступен.", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            btn("💲 CryptoBot", callback_data=f"gift_pay_crypto_{target}_{days}", icon="💲"),
+            btn("⭐️ Telegram Stars", callback_data=f"gift_pay_stars_{target}_{days}", icon="⭐️"),
+        ],
+        [btn("◀️ Назад", callback_data=f"gift_to_{target}", icon="◀️")],
+    ])
+    await cleanup_user_messages(uid)
+    await send_message_with_image(uid, premium_payment_text(uid, days, target), None, kb)
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data.startswith("gift_pay_crypto_"))
+async def gift_pay_crypto(callback_query: types.CallbackQuery):
+    try:
+        _, _, _, target_s, days_s = callback_query.data.split("_")
+        target, days = int(target_s), int(days_s)
+    except ValueError:
+        await callback_query.answer()
+        return
+    if target == callback_query.from_user.id:
+        await callback_query.answer()
+        return
+    await start_crypto_payment(callback_query, days, target)
+
+
+@dp.callback_query(lambda c: c.data.startswith("gift_pay_stars_"))
+async def gift_pay_stars(callback_query: types.CallbackQuery):
+    try:
+        _, _, _, target_s, days_s = callback_query.data.split("_")
+        target, days = int(target_s), int(days_s)
+    except ValueError:
+        await callback_query.answer()
+        return
+    if target == callback_query.from_user.id:
+        await callback_query.answer()
+        return
+    await start_stars_payment(callback_query, days, target)
 
 
 @dp.callback_query(lambda c: c.data == "edit_profile")
@@ -2841,6 +3337,7 @@ class OwnerStates(StatesGroup):
     waiting_for_search = State()
     waiting_for_rating = State()
     waiting_for_admin = State()
+    waiting_for_promo = State()
 
 
 def strip_tags(text):
@@ -2866,6 +3363,7 @@ def owner_main_keyboard():
         [InlineKeyboardButton(text="📊 Статистика", callback_data="own_stats")],
         [InlineKeyboardButton(text="🔍 Найти игрока", callback_data="own_search")],
         [InlineKeyboardButton(text="👮 Админы", callback_data="own_admins")],
+        [InlineKeyboardButton(text="🎟 Промокоды", callback_data="own_promos")],
         [InlineKeyboardButton(text="❌ Закрыть", callback_data="own_close")],
     ])
 
@@ -3281,6 +3779,135 @@ async def cmd_postmatch(message: types.Message):
         return
     ok, reason = await maybe_post_match_result(lobby_id, force=True)
     await message.answer("📣 Результаты матча опубликованы в канале." if ok else f"❌ {reason}")
+
+
+# ---------- промокоды (панель владельца) ----------
+PROMO_KIND_ALIASES = {
+    "days": "days", "day": "days", "дни": "days", "дней": "days", "дн": "days",
+    "percent": "percent", "процент": "percent", "процентов": "percent", "%": "percent",
+}
+
+
+def generate_promo_code():
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(random.choice(alphabet) for _ in range(8))
+
+
+def parse_promo_input(text):
+    """КОД ТИП ЗНАЧЕНИЕ [ЛИМИТ] [ДНЕЙ_ДЕЙСТВИЯ] -> ((code, kind, value, max_uses, valid_days), None) или (None, ошибка)."""
+    parts = (text or "").split()
+    if len(parts) < 3:
+        return None, "Нужно минимум три слова: КОД ТИП ЗНАЧЕНИЕ"
+    code = parts[0].upper()
+    if code in ("AUTO", "АВТО"):
+        code = generate_promo_code()
+    if not re.fullmatch(r"[A-Z0-9_-]{3,20}", code):
+        return None, "Код: 3-20 символов, только латинские буквы, цифры, «-» и «_»."
+    kind = PROMO_KIND_ALIASES.get(parts[1].lower())
+    if not kind:
+        return None, "Тип: days (дни Premium) или percent (скидка в %)."
+    try:
+        value = int(parts[2])
+        max_uses = int(parts[3]) if len(parts) > 3 else 1
+        valid_days = int(parts[4]) if len(parts) > 4 else None
+    except ValueError:
+        return None, "Значение, лимит и срок должны быть числами."
+    if kind == "days" and not 1 <= value <= 365:
+        return None, "Дней Premium должно быть от 1 до 365."
+    if kind == "percent" and not 1 <= value <= 90:
+        return None, "Скидка должна быть от 1 до 90 процентов."
+    if not 0 <= max_uses <= 100000:
+        return None, "Лимит использований: от 0 (без лимита) до 100000."
+    if valid_days is not None and not 1 <= valid_days <= 3650:
+        return None, "Срок действия в днях: от 1 до 3650."
+    return (code, kind, value, max_uses, valid_days), None
+
+
+def format_promo_line(code, kind, value, max_uses, uses, expires_at, active):
+    what = f"+{value} дн. Premium" if kind == "days" else f"скидка {value}%"
+    limit = f"{uses}/{max_uses}" if max_uses else f"{uses}/∞"
+    until = f", до {fmt_dt(expires_at)}" if expires_at else ""
+    return f"{'🟢' if active else '🔴'} {code} — {what} — {limit}{until}"
+
+
+@dp.callback_query(lambda c: c.data == "own_promos")
+async def own_promos(callback_query: types.CallbackQuery, state: FSMContext = None):
+    if not await owner_guard(callback_query):
+        return
+    if state is not None:
+        await state.clear()
+    promos = db.list_promos(15)
+    lines = ["🎟 Промокоды (последние 15)\n"]
+    rows = []
+    if not promos:
+        lines.append("Пока нет ни одного промокода.")
+    for code, kind, value, max_uses, uses, expires_at, active in promos:
+        lines.append(format_promo_line(code, kind, value, max_uses, uses, expires_at, active))
+        rows.append([InlineKeyboardButton(
+            text=f"{'⏸ Выключить' if active else '▶️ Включить'} {code}",
+            callback_data=f"own_promo_tgl_{code}",
+        )])
+    rows.append([InlineKeyboardButton(text="➕ Создать промокод", callback_data="own_promo_new")])
+    rows.append([InlineKeyboardButton(text="◀️ В панель", callback_data="own_menu")])
+    await owner_edit(callback_query, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback_query.answer()
+
+
+@dp.callback_query(lambda c: c.data == "own_promo_new")
+async def own_promo_new(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    await state.set_state(OwnerStates.waiting_for_promo)
+    await owner_edit(
+        callback_query,
+        "➕ Новый промокод. Отправьте одной строкой:\n\n"
+        "КОД ТИП ЗНАЧЕНИЕ [ЛИМИТ] [ДНЕЙ_ДЕЙСТВИЯ]\n\n"
+        "Примеры:\n"
+        "SUMMER days 7 50 30 — 7 дней Premium, 50 использований, действует 30 дней\n"
+        "SALE percent 20 100 — скидка 20% на покупку, 100 использований\n"
+        "auto days 3 — случайный код, 3 дня Premium, одно использование\n\n"
+        "Лимит по умолчанию 1, 0 = без лимита. Скидки не суммируются с «первой покупкой»: берётся лучшая.",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="◀️ Отмена", callback_data="own_promos")]]),
+    )
+    await callback_query.answer()
+
+
+@dp.message(OwnerStates.waiting_for_promo)
+async def own_promo_value(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        return
+    parsed, err = parse_promo_input(message.text or "")
+    if err:
+        await message.answer(f"❌ {err}")
+        return
+    code, kind, value, max_uses, valid_days = parsed
+    ok, create_err = db.create_promo(code, kind, value, max_uses, valid_days, message.from_user.id)
+    if not ok:
+        await message.answer(f"❌ {create_err}")
+        return
+    db.log_admin_action(message.from_user.id, "create_promo", None, f"{code} {kind} {value} limit={max_uses}")
+    await state.clear()
+    await message.answer(
+        f"✅ Промокод создан: {code}\n"
+        f"{'+' + str(value) + ' дн. Premium' if kind == 'days' else 'Скидка ' + str(value) + '%'}, "
+        f"лимит: {max_uses or 'без лимита'}"
+        f"{', действует ' + str(valid_days) + ' дн.' if valid_days else ''}\n\n"
+        "Игроки вводят его в меню Premium → «Промокод».",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎟 К списку промокодов", callback_data="own_promos")]]),
+    )
+
+
+@dp.callback_query(lambda c: c.data.startswith("own_promo_tgl_"))
+async def own_promo_toggle(callback_query: types.CallbackQuery, state: FSMContext):
+    if not await owner_guard(callback_query):
+        return
+    code = callback_query.data.replace("own_promo_tgl_", "")
+    new_state = db.toggle_promo(code)
+    if new_state is None:
+        await callback_query.answer("Промокод не найден.", show_alert=True)
+        return
+    db.log_admin_action(callback_query.from_user.id, "toggle_promo", None, f"{code} -> {'on' if new_state else 'off'}")
+    await own_promos(callback_query, state)
 
 
 async def cleanup_old_messages():

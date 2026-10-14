@@ -153,6 +153,7 @@ class Database:
             self.conn.commit()
             self._migrate_players_profile_premium()
             self._migrate_owner_panel_tables()
+            self._migrate_monetization_tables()
             logger.info("Tables created successfully")
         except Exception as e:
             logger.error(f"Error creating tables: {e}")
@@ -305,8 +306,8 @@ class Database:
             self.conn.rollback()
             return False
 
-    def grant_premium_days(self, user_id, days):
-        """Выдаёт дни Premium вручную (без бонуса +100 рейтинга). Возвращает новую дату окончания или None."""
+    def grant_premium_days(self, user_id, days, provider="owner_grant", ref=None, bonus_rating=0):
+        """Выдаёт дни Premium вручную или по промокоду (без бонуса +100 рейтинга). Возвращает новую дату окончания или None."""
         try:
             self.ensure_connection()
             self.cursor.execute("SELECT premium_until FROM players WHERE user_id = %s", (user_id,))
@@ -325,9 +326,11 @@ class Database:
                     pass
             new_until = (base + timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
             self.cursor.execute("UPDATE players SET premium_until = %s WHERE user_id = %s", (new_until, user_id))
+            if bonus_rating:
+                self.cursor.execute("UPDATE player_stats SET rating = rating + %s WHERE user_id = %s", (int(bonus_rating), user_id))
             self.cursor.execute(
                 "INSERT INTO premium_transactions (user_id, days, provider, provider_ref, created_at) VALUES (%s, %s, %s, %s, %s)",
-                (user_id, int(days), "owner_grant", f"owner_grant_{user_id}_{int(now.timestamp() * 1000)}", self._now_str()),
+                (user_id, int(days), provider, ref or f"{provider}_{user_id}_{int(now.timestamp() * 1000)}", self._now_str()),
             )
             self.conn.commit()
             return new_until
@@ -372,8 +375,8 @@ class Database:
                 "lobbies_today": one("SELECT COUNT(*) FROM lobbies WHERE created_at >= %s", (today,)),
                 "stats_entries": one("SELECT COUNT(*) FROM stats_history"),
                 "premium_active": one("SELECT COUNT(*) FROM players WHERE premium_until IS NOT NULL AND premium_until > %s", (now_s,)),
-                "premium_buys_30d": one("SELECT COUNT(*) FROM premium_transactions WHERE provider <> 'owner_grant' AND created_at >= %s", (month_ago,)),
-                "premium_buys_total": one("SELECT COUNT(*) FROM premium_transactions WHERE provider <> 'owner_grant'"),
+                "premium_buys_30d": one("SELECT COUNT(*) FROM premium_transactions WHERE provider IN ('cryptobot', 'telegram_stars') AND created_at >= %s", (month_ago,)),
+                "premium_buys_total": one("SELECT COUNT(*) FROM premium_transactions WHERE provider IN ('cryptobot', 'telegram_stars')"),
             }
             self.conn.commit()
             return stats
@@ -426,6 +429,376 @@ class Database:
         except Exception as e:
             logger.error(f"Error unmarking match posted {lobby_id}: {e}")
             self.conn.rollback()
+
+    def _migrate_monetization_tables(self):
+        """Промокоды, заказы Premium (счета CryptoBot/Stars), хранилище состояний диалогов и служебные значения."""
+        try:
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS promo_codes (
+                    code TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    value INTEGER NOT NULL,
+                    max_uses INTEGER DEFAULT 1,
+                    uses INTEGER DEFAULT 0,
+                    expires_at TEXT,
+                    active BOOLEAN DEFAULT TRUE,
+                    created_by BIGINT,
+                    created_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS promo_redemptions (
+                    id SERIAL PRIMARY KEY,
+                    code TEXT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    kind TEXT,
+                    value INTEGER,
+                    redeemed_at TEXT,
+                    applied_order_id INTEGER,
+                    UNIQUE (code, user_id)
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS premium_orders (
+                    id SERIAL PRIMARY KEY,
+                    provider TEXT,
+                    provider_ref TEXT,
+                    invoice_id BIGINT,
+                    buyer_id BIGINT NOT NULL,
+                    recipient_id BIGINT NOT NULL,
+                    days INTEGER NOT NULL,
+                    price_usd TEXT,
+                    price_stars INTEGER,
+                    discount_percent INTEGER DEFAULT 0,
+                    promo_code TEXT,
+                    status TEXT DEFAULT 'pending',
+                    created_at TEXT,
+                    paid_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS fsm_storage (
+                    key TEXT PRIMARY KEY,
+                    state TEXT,
+                    data TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS bot_kv (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                )
+            ''')
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_buyer ON premium_orders(buyer_id)")
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_invoice ON premium_orders(invoice_id)")
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Migration monetization tables failed: {e}")
+            self.conn.rollback()
+
+    # ---------- служебные значения (kv) ----------
+    def kv_set(self, key, value):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO bot_kv (key, value, updated_at) VALUES (%s, %s, %s)
+                   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at""",
+                (key, str(value), self._now_str()),
+            )
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error kv_set {key}: {e}")
+            self.conn.rollback()
+            return False
+
+    def kv_get(self, key):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT value FROM bot_kv WHERE key = %s", (key,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row[0] if row else None
+        except Exception as e:
+            logger.error(f"Error kv_get {key}: {e}")
+            self.conn.rollback()
+            return None
+
+    def kv_delete(self, key):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("DELETE FROM bot_kv WHERE key = %s", (key,))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error kv_delete {key}: {e}")
+            self.conn.rollback()
+
+    # ---------- хранилище состояний диалогов (FSM) ----------
+    def fsm_get(self, key):
+        """Возвращает (state, data_json)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT state, data FROM fsm_storage WHERE key = %s", (key,))
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            if not row:
+                return None, "{}"
+            return row[0], row[1] or "{}"
+        except Exception as e:
+            logger.error(f"Error fsm_get {key}: {e}")
+            self.conn.rollback()
+            return None, "{}"
+
+    def _fsm_cleanup(self, key):
+        self.cursor.execute("DELETE FROM fsm_storage WHERE key = %s AND state IS NULL AND (data IS NULL OR data = '{}')", (key,))
+
+    def fsm_set_state(self, key, state):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO fsm_storage (key, state, data, updated_at) VALUES (%s, %s, '{}', %s)
+                   ON CONFLICT (key) DO UPDATE SET state = EXCLUDED.state, updated_at = EXCLUDED.updated_at""",
+                (key, state, self._now_str()),
+            )
+            self._fsm_cleanup(key)
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error fsm_set_state {key}: {e}")
+            self.conn.rollback()
+
+    def fsm_set_data(self, key, data_json):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO fsm_storage (key, state, data, updated_at) VALUES (%s, NULL, %s, %s)
+                   ON CONFLICT (key) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at""",
+                (key, data_json, self._now_str()),
+            )
+            self._fsm_cleanup(key)
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error fsm_set_data {key}: {e}")
+            self.conn.rollback()
+
+    # ---------- промокоды ----------
+    def create_promo(self, code, kind, value, max_uses, valid_days, created_by):
+        """Возвращает (True, None) или (False, текст ошибки)."""
+        try:
+            self.ensure_connection()
+            expires_at = None
+            if valid_days:
+                expires_at = (datetime.now() + timedelta(days=int(valid_days))).strftime("%Y-%m-%d %H:%M:%S")
+            self.cursor.execute(
+                """INSERT INTO promo_codes (code, kind, value, max_uses, expires_at, created_by, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT (code) DO NOTHING RETURNING code""",
+                (code, kind, int(value), int(max_uses), expires_at, created_by, self._now_str()),
+            )
+            created = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return (True, None) if created else (False, "Такой код уже существует.")
+        except Exception as e:
+            logger.error(f"Error creating promo {code}: {e}")
+            self.conn.rollback()
+            return False, "Ошибка базы данных."
+
+    def list_promos(self, limit=15):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "SELECT code, kind, value, max_uses, uses, expires_at, active FROM promo_codes ORDER BY created_at DESC LIMIT %s",
+                (limit,),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+            return rows
+        except Exception as e:
+            logger.error(f"Error listing promos: {e}")
+            self.conn.rollback()
+            return []
+
+    def toggle_promo(self, code):
+        """Включает/выключает код. Возвращает новое состояние (True/False) или None, если кода нет."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT active FROM promo_codes WHERE code = %s", (code,))
+            row = self.cursor.fetchone()
+            if not row:
+                self.conn.commit()
+                return None
+            new_state = not bool(row[0])
+            self.cursor.execute("UPDATE promo_codes SET active = %s WHERE code = %s", (new_state, code))
+            self.conn.commit()
+            return new_state
+        except Exception as e:
+            logger.error(f"Error toggling promo {code}: {e}")
+            self.conn.rollback()
+            return None
+
+    def redeem_promo(self, user_id, code):
+        """Активирует код для игрока. Возвращает (kind, value, ошибка); ошибка=None при успехе."""
+        code = (code or "").strip().upper()
+        try:
+            self.ensure_connection()
+            c = self.cursor
+            c.execute("SELECT kind, value, max_uses, uses, expires_at, active FROM promo_codes WHERE code = %s", (code,))
+            row = c.fetchone()
+            if not row:
+                self.conn.commit()
+                return None, None, "Такого промокода нет."
+            kind, value, max_uses, uses, expires_at, active = row
+            if not active:
+                self.conn.commit()
+                return None, None, "Этот промокод отключён."
+            if expires_at and expires_at <= self._now_str():
+                self.conn.commit()
+                return None, None, "Срок действия промокода истёк."
+            if max_uses and uses >= max_uses:
+                self.conn.commit()
+                return None, None, "Промокод уже использован максимальное число раз."
+            c.execute(
+                """INSERT INTO promo_redemptions (code, user_id, kind, value, redeemed_at)
+                   VALUES (%s, %s, %s, %s, %s) ON CONFLICT (code, user_id) DO NOTHING RETURNING id""",
+                (code, user_id, kind, value, self._now_str()),
+            )
+            if c.fetchone() is None:
+                self.conn.commit()
+                return None, None, "Вы уже использовали этот промокод."
+            c.execute(
+                "UPDATE promo_codes SET uses = uses + 1 WHERE code = %s AND (max_uses = 0 OR uses < max_uses) RETURNING uses",
+                (code,),
+            )
+            if c.fetchone() is None:
+                self.conn.rollback()
+                return None, None, "Промокод уже использован максимальное число раз."
+            self.conn.commit()
+            return kind, value, None
+        except Exception as e:
+            logger.error(f"Error redeeming promo {code} for {user_id}: {e}")
+            self.conn.rollback()
+            return None, None, "Ошибка базы данных, попробуйте позже."
+
+    def cancel_promo_redemption(self, user_id, code):
+        """Откатывает активацию (если не удалось выдать награду)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("DELETE FROM promo_redemptions WHERE code = %s AND user_id = %s RETURNING id", ((code or "").upper(), user_id))
+            if self.cursor.fetchone() is not None:
+                self.cursor.execute("UPDATE promo_codes SET uses = GREATEST(0, uses - 1) WHERE code = %s", ((code or "").upper(),))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error cancelling promo redemption {code}/{user_id}: {e}")
+            self.conn.rollback()
+
+    def get_best_pending_promo_discount(self, user_id):
+        """Лучшая активированная, но ещё не использованная скидка: (code, percent) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT code, value FROM promo_redemptions
+                   WHERE user_id = %s AND kind = 'percent' AND applied_order_id IS NULL
+                   ORDER BY value DESC LIMIT 1""",
+                (user_id,),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return (row[0], row[1]) if row else None
+        except Exception as e:
+            logger.error(f"Error getting promo discount for {user_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def mark_promo_applied(self, user_id, code, order_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE promo_redemptions SET applied_order_id = %s WHERE user_id = %s AND code = %s AND applied_order_id IS NULL",
+                (order_id, user_id, code),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error marking promo applied {code}/{user_id}: {e}")
+            self.conn.rollback()
+
+    # ---------- заказы Premium ----------
+    def create_premium_order(self, provider, buyer_id, recipient_id, days, price_usd, price_stars, discount_percent, promo_code):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """INSERT INTO premium_orders (provider, buyer_id, recipient_id, days, price_usd, price_stars,
+                                               discount_percent, promo_code, created_at)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+                (provider, buyer_id, recipient_id, days, str(price_usd), int(price_stars), int(discount_percent), promo_code, self._now_str()),
+            )
+            order_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return order_id
+        except Exception as e:
+            logger.error(f"Error creating premium order: {e}")
+            self.conn.rollback()
+            return None
+
+    def set_order_invoice(self, order_id, invoice_id):
+        try:
+            self.ensure_connection()
+            self.cursor.execute("UPDATE premium_orders SET invoice_id = %s WHERE id = %s", (int(invoice_id), order_id))
+            self.conn.commit()
+            return True
+        except Exception as e:
+            logger.error(f"Error setting order invoice: {e}")
+            self.conn.rollback()
+            return False
+
+    def get_premium_order(self, order_id):
+        """(id, provider, provider_ref, invoice_id, buyer_id, recipient_id, days, price_usd, price_stars,
+            discount_percent, promo_code, status) или None."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                """SELECT id, provider, provider_ref, invoice_id, buyer_id, recipient_id, days, price_usd, price_stars,
+                          discount_percent, promo_code, status FROM premium_orders WHERE id = %s""",
+                (order_id,),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return row
+        except Exception as e:
+            logger.error(f"Error getting premium order {order_id}: {e}")
+            self.conn.rollback()
+            return None
+
+    def mark_order_paid(self, order_id, provider_ref):
+        try:
+            self.ensure_connection()
+            self.cursor.execute(
+                "UPDATE premium_orders SET status = 'paid', provider_ref = %s, paid_at = %s WHERE id = %s",
+                (provider_ref, self._now_str(), order_id),
+            )
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error marking order {order_id} paid: {e}")
+            self.conn.rollback()
+
+    def has_paid_premium(self, user_id):
+        """Покупал ли игрок Premium раньше (себе или в подарок)."""
+        try:
+            self.ensure_connection()
+            self.cursor.execute("SELECT 1 FROM premium_orders WHERE buyer_id = %s AND status = 'paid' LIMIT 1", (user_id,))
+            if self.cursor.fetchone():
+                self.conn.commit()
+                return True
+            self.cursor.execute(
+                "SELECT 1 FROM premium_transactions WHERE user_id = %s AND provider IN ('cryptobot', 'telegram_stars') LIMIT 1",
+                (user_id,),
+            )
+            found = self.cursor.fetchone() is not None
+            self.conn.commit()
+            return found
+        except Exception as e:
+            logger.error(f"Error has_paid_premium {user_id}: {e}")
+            self.conn.rollback()
+            return True  # при ошибке скидку не даём
 
     def create_indexes(self):
         try:
