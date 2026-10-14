@@ -142,10 +142,6 @@ PREMIUM_EMOJI = {
     "🌍": ("5399898266265475100", "🌍"),
     "🔫": ("5222486447306602688", "🔫"),
     "🎲": ("5388644605841387896", "🎲"),
-    "🏁": ("5411520005386806155", "🏁"),
-    "🎲": ("5400005395634734568", "🎲"),
-    "🥇": ("5440539497383087970", "🥇"),
-    "🥈": ("5447203607294265305", "🥈"),
     "👥": ("5190892530438260422", "👥"),
     "✨": ("5325547803936572038", "✨"),
     "❗️": ("5274099962655816924", "❗️"),
@@ -3744,23 +3740,18 @@ async def maybe_post_match_result(lobby_id, force=False):
     if not db.mark_match_posted(lobby_id):
         return False, "Результаты этого матча уже публиковались"
 
-    medals = [pe("🥇"), pe("🥈"), "🥉"]
+    medals = ["🥇", "🥈", "🥉"]
     lines = [
-        f"{pe('🏁')} Матч #{esc(lobby_info[1])} завершён",
-        f"{pe('🎲')} Режим: {esc(lobby_info[4])}",
-        f"{pe('🗺')} Карта: {esc(lobby_info[5])}",
+        f"🏁 Матч #{lobby_info[1]} завершён",
+        f"🎲 Режим: {lobby_info[4]}",
+        f"🗺 Карта: {lobby_info[5]}",
         "",
     ]
     for i, (user_id, nickname, kills, deaths, rating_added) in enumerate(results[:10]):
         kd = kills / deaths if deaths > 0 else kills
         place = medals[i] if i < len(medals) else f"{i + 1}."
-        safe_nickname = esc(nickname or "")
-        if is_admin(user_id):
-            safe_nickname += f" {pe('✔')}"
-        elif db.is_premium(user_id):
-            safe_nickname += f" {pe('⭐️')}"
-        lines.append(f"{place} {safe_nickname} — {kills}/{deaths} (K/D {kd:.2f}) · +{rating_added}")
-    lines += ["", f"{pe('👥')} Игроков: {len(results)}"]
+        lines.append(f"{place} {strip_tags(nickname)} — {kills}/{deaths} (K/D {kd:.2f}) · +{rating_added}")
+    lines += ["", f"👥 Игроков: {len(results)}"]
 
     keyboard = None
     link = await make_bot_link("join_lobby")
@@ -3769,7 +3760,7 @@ async def maybe_post_match_result(lobby_id, force=False):
             [InlineKeyboardButton(text="🎮 Играть в боте", url=link)]
         ])
     try:
-        await bot.send_message(chat_id=CHANNEL_ID, text="\n".join(lines), reply_markup=keyboard, parse_mode="HTML")
+        await bot.send_message(chat_id=CHANNEL_ID, text="\n".join(lines), reply_markup=keyboard)
     except Exception as e:
         db.unmark_match_posted(lobby_id)
         logger.error(f"Error posting match result for lobby {lobby_id}: {e}")
