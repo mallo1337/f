@@ -1840,6 +1840,84 @@ class Database:
             logger.error(f"Error getting lobby history count for user {user_id}: {e}")
             return 0
 
+    def get_player_lobby_filter_options(self, user_id, field):
+        'Возвращает уникальные режимы или карты завершённых лобби игрока.'
+        if field not in ("mode", "map_name"):
+            return []
+        try:
+            self.ensure_connection()
+            self.cursor.execute(f'''
+                SELECT DISTINCT l.{field}
+                FROM lobbies l
+                JOIN lobby_players lp ON l.lobby_id = lp.lobby_id
+                WHERE lp.user_id = %s AND l.status = 'completed'
+                  AND l.{field} IS NOT NULL AND l.{field} <> ''
+                ORDER BY l.{field}
+            ''', (user_id,))
+            return [row[0] for row in self.cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting lobby history filter options ({field}) for user {user_id}: {e}")
+            return []
+
+    def get_filtered_player_lobby_history(self, user_id, mode=None, map_name=None, days=0, offset=0, limit=5):
+        'История завершённых лобби с необязательными фильтрами режима, карты и периода.'
+        try:
+            self.ensure_connection()
+            conditions = ["lp.user_id = %s", "l.status = 'completed'"]
+            params = [user_id, user_id]
+            if mode:
+                conditions.append("l.mode = %s")
+                params.append(mode)
+            if map_name:
+                conditions.append("l.map_name = %s")
+                params.append(map_name)
+            if days and int(days) in (7, 30, 90):
+                cutoff = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+                conditions.append("l.created_at >= %s")
+                params.append(cutoff)
+            params.extend([limit, offset])
+            self.cursor.execute(f'''
+                SELECT l.lobby_id, l.lobby_unique_id, l.mode, l.map_name, l.created_at,
+                       COALESCE(sh.kills_added, 0), COALESCE(sh.deaths_added, 0),
+                       COALESCE(sh.rating_added, 0), COALESCE(sh.created_at, l.created_at),
+                       CASE WHEN sh.history_id IS NOT NULL THEN true ELSE false END
+                FROM lobbies l
+                JOIN lobby_players lp ON l.lobby_id = lp.lobby_id
+                LEFT JOIN stats_history sh ON l.lobby_id = sh.lobby_id AND sh.user_id = %s
+                WHERE {" AND ".join(conditions)}
+                ORDER BY l.created_at DESC LIMIT %s OFFSET %s
+            ''', tuple(params))
+            return self.cursor.fetchall()
+        except Exception as e:
+            logger.error(f"Error getting filtered lobby history for user {user_id}: {e}")
+            return []
+
+    def get_filtered_player_lobby_history_count(self, user_id, mode=None, map_name=None, days=0):
+        try:
+            self.ensure_connection()
+            conditions = ["lp.user_id = %s", "l.status = 'completed'"]
+            params = [user_id]
+            if mode:
+                conditions.append("l.mode = %s")
+                params.append(mode)
+            if map_name:
+                conditions.append("l.map_name = %s")
+                params.append(map_name)
+            if days and int(days) in (7, 30, 90):
+                cutoff = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d %H:%M:%S")
+                conditions.append("l.created_at >= %s")
+                params.append(cutoff)
+            self.cursor.execute(f'''
+                SELECT COUNT(*) FROM lobbies l
+                JOIN lobby_players lp ON l.lobby_id = lp.lobby_id
+                WHERE {" AND ".join(conditions)}
+            ''', tuple(params))
+            result = self.cursor.fetchone()
+            return result[0] if result else 0
+        except Exception as e:
+            logger.error(f"Error counting filtered lobby history for user {user_id}: {e}")
+            return 0
+
     def update_lobby_channel_message_id(self, lobby_id, message_id):
         try:
             self.ensure_connection()

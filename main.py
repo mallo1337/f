@@ -491,6 +491,7 @@ def get_lobby_history_keyboard(user_id, current_offset=0, has_next=False, total_
     if nav_buttons:
         keyboard.append(nav_buttons)
 
+    keyboard.append([btn("🔎 Фильтры Premium", callback_data=f"hf|{user_id}|-1|-1|0|0|menu", icon="🔎")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def is_valid_game_id(game_id):
@@ -2461,6 +2462,138 @@ async def show_next_lobby_history(callback_query: types.CallbackQuery):
         logger.error(f"Error in history_next: {e}")
         await callback_query.answer("❌ Ошибка при загрузке истории", show_alert=True)
     await callback_query.answer()
+
+def _history_filter_state(user_id, mode_idx=-1, map_idx=-1, days=0, offset=0, action="menu", arg=""):
+    return f"hf|{user_id}|{mode_idx}|{map_idx}|{days}|{offset}|{action}|{arg}"
+
+
+def _history_filter_label(mode, map_name, days):
+    parts = []
+    if mode:
+        parts.append(f"режим: {mode}")
+    if map_name:
+        parts.append(f"карта: {map_name}")
+    if days:
+        parts.append(f"период: {days} дн.")
+    return ", ".join(parts) if parts else "не выбраны"
+
+
+def _history_filter_menu_keyboard(user_id, mode_idx, map_idx, days, offset):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn("🎮 Выбрать режим", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "mode"), icon="🎮")],
+        [btn("🗺 Выбрать карту", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "map"), icon="🗺")],
+        [btn("📅 Период", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "period"), icon="📅")],
+        [btn("♻️ Сбросить фильтры", callback_data=_history_filter_state(user_id, -1, -1, 0, 0, "apply"), icon="♻️")],
+        [btn("📋 Показать матчи", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, 0, "apply"), icon="📋")],
+        [btn("◀️ Назад к истории", callback_data="lobby_history", icon="◀️")],
+    ])
+
+
+@dp.callback_query(lambda c: c.data.startswith("hf|"))
+async def handle_lobby_history_filters(callback_query: types.CallbackQuery):
+    try:
+        parts = callback_query.data.split("|", 7)
+        _, user_raw, mode_raw, map_raw, days_raw, offset_raw, action = parts[:7]
+        arg = parts[7] if len(parts) > 7 else ""
+        user_id = int(user_raw)
+        mode_idx, map_idx, days, offset = int(mode_raw), int(map_raw), int(days_raw), int(offset_raw)
+        if callback_query.from_user.id != user_id:
+            await callback_query.answer("❌ Вы можете смотреть только свою историю", show_alert=True)
+            return
+        if not db.is_premium(user_id):
+            await callback_query.answer("⭐️ Фильтры истории доступны с Premium", show_alert=True)
+            return
+
+        modes = db.get_player_lobby_filter_options(user_id, "mode")
+        maps = db.get_player_lobby_filter_options(user_id, "map_name")
+        mode = modes[mode_idx] if 0 <= mode_idx < len(modes) else None
+        map_name = maps[map_idx] if 0 <= map_idx < len(maps) else None
+
+        if action == "mode":
+            rows = [[btn("Все режимы", callback_data=_history_filter_state(user_id, -1, map_idx, days, 0, "setmode"), icon="🎮")]]
+            rows += [[btn(str(value)[:50], callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, 0, "setmode", str(i)), icon="🎮")] for i, value in enumerate(modes)]
+            rows.append([btn("◀️ Назад", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "menu"), icon="◀️")])
+            await cleanup_user_messages(user_id)
+            await send_message_with_image(user_id, f"{pe('🎮')} Выберите режим матча:", None, InlineKeyboardMarkup(inline_keyboard=rows))
+        elif action == "map":
+            rows = [[btn("Все карты", callback_data=_history_filter_state(user_id, mode_idx, -1, days, 0, "setmap"), icon="🗺")]]
+            rows += [[btn(str(value)[:50], callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, 0, "setmap", str(i)), icon="🗺")] for i, value in enumerate(maps)]
+            rows.append([btn("◀️ Назад", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "menu"), icon="◀️")])
+            await cleanup_user_messages(user_id)
+            await send_message_with_image(user_id, f"{pe('🗺')} Выберите карту:", None, InlineKeyboardMarkup(inline_keyboard=rows))
+        elif action == "period":
+            rows = [
+                [btn("За всё время", callback_data=_history_filter_state(user_id, mode_idx, map_idx, 0, 0, "setdays"), icon="📅")],
+                [btn("За 7 дней", callback_data=_history_filter_state(user_id, mode_idx, map_idx, 7, 0, "setdays"), icon="📅")],
+                [btn("За 30 дней", callback_data=_history_filter_state(user_id, mode_idx, map_idx, 30, 0, "setdays"), icon="📅")],
+                [btn("За 90 дней", callback_data=_history_filter_state(user_id, mode_idx, map_idx, 90, 0, "setdays"), icon="📅")],
+                [btn("◀️ Назад", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "menu"), icon="◀️")],
+            ]
+            await cleanup_user_messages(user_id)
+            await send_message_with_image(user_id, f"{pe('📅')} Выберите период:", None, InlineKeyboardMarkup(inline_keyboard=rows))
+        elif action == "setmode":
+            mode_idx = int(arg) if arg else -1
+            await cleanup_user_messages(user_id)
+            await send_message_with_image(user_id, f"{pe('🔎')} Фильтры: {_history_filter_label(modes[mode_idx] if 0 <= mode_idx < len(modes) else None, map_name, days)}", None, _history_filter_menu_keyboard(user_id, mode_idx, map_idx, days, 0))
+        elif action == "setmap":
+            map_idx = int(arg) if arg else -1
+            await cleanup_user_messages(user_id)
+            await send_message_with_image(user_id, f"{pe('🔎')} Фильтры: {_history_filter_label(mode, maps[map_idx] if 0 <= map_idx < len(maps) else None, days)}", None, _history_filter_menu_keyboard(user_id, mode_idx, map_idx, days, 0))
+        elif action == "setdays":
+            days = days if days in (7, 30, 90) else 0
+            await cleanup_user_messages(user_id)
+            await send_message_with_image(user_id, f"{pe('🔎')} Фильтры: {_history_filter_label(mode, map_name, days)}", None, _history_filter_menu_keyboard(user_id, mode_idx, map_idx, days, 0))
+        elif action == "menu":
+            await cleanup_user_messages(user_id)
+            await send_message_with_image(user_id, f"{pe('🔎')} Фильтры истории матчей\n\nТекущие фильтры: {_history_filter_label(mode, map_name, days)}", None, _history_filter_menu_keyboard(user_id, mode_idx, map_idx, days, offset))
+        elif action == "page":
+            offset = max(0, int(arg or 0))
+            await _show_filtered_lobby_history(user_id, mode_idx, map_idx, days, offset, modes, maps)
+        elif action == "apply":
+            await _show_filtered_lobby_history(user_id, mode_idx, map_idx, days, 0, modes, maps)
+        await callback_query.answer()
+    except (ValueError, IndexError) as e:
+        logger.error(f"Error in lobby history filters: {e}")
+        await callback_query.answer("❌ Ошибка фильтра истории", show_alert=True)
+
+
+async def _show_filtered_lobby_history(user_id, mode_idx, map_idx, days, offset, modes=None, maps=None):
+    modes = modes if modes is not None else db.get_player_lobby_filter_options(user_id, "mode")
+    maps = maps if maps is not None else db.get_player_lobby_filter_options(user_id, "map_name")
+    mode = modes[mode_idx] if 0 <= mode_idx < len(modes) else None
+    map_name = maps[map_idx] if 0 <= map_idx < len(maps) else None
+    lobbies = db.get_filtered_player_lobby_history(user_id, mode, map_name, days, offset, 5)
+    total = db.get_filtered_player_lobby_history_count(user_id, mode, map_name, days)
+    if not lobbies:
+        text = f"{pe('🔎')} По выбранным фильтрам матчей нет.\n\nФильтры: {_history_filter_label(mode, map_name, days)}"
+    else:
+        pages = max(1, (total + 4) // 5)
+        text = f"{pe('🎮')} История матчей ({offset // 5 + 1}/{pages})\nФильтры: {_history_filter_label(mode, map_name, days)}\n\n"
+        for i, lobby in enumerate(lobbies):
+            (_, unique_id, lobby_mode, lobby_map, created_at, kills, deaths, rating, _, has_stats) = lobby
+            try:
+                lobby_date = datetime.strptime(str(created_at), "%Y-%m-%d %H:%M:%S").strftime("%d.%m.%Y %H:%M")
+            except (ValueError, TypeError):
+                lobby_date = str(created_at)
+            text += f"{pe('🔹')} Лобби #{unique_id}\n{pe('🗺')} Карта: {lobby_map}\n{pe('🎮')} Режим: {lobby_mode}\n"
+            if has_stats and kills > 0:
+                text += f"Убийств: {kills} | Смертей: {deaths}\n{pe('🏆')} Рейтинг: +{rating}\n"
+            else:
+                text += f"{pe('🔎')} Статистика на модерации\n"
+            text += f"{pe('🕗')} Дата: {lobby_date}\n\n"
+    rows = []
+    if offset > 0 or offset + 5 < total:
+        nav = []
+        if offset > 0:
+            nav.append(btn("⬅️", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "page", str(max(0, offset - 5))), icon="⬅️"))
+        if offset + 5 < total:
+            nav.append(btn("➡️", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "page", str(offset + 5)), icon="➡️"))
+        rows.append(nav)
+    rows.append([btn("🔎 Изменить фильтры", callback_data=_history_filter_state(user_id, mode_idx, map_idx, days, offset, "menu"), icon="🔎")])
+    rows.append([btn("◀️ К истории", callback_data="lobby_history", icon="◀️")])
+    await cleanup_user_messages(user_id)
+    await send_message_with_image(user_id, text, None, InlineKeyboardMarkup(inline_keyboard=rows))
+
 
 @dp.callback_query(lambda c: c.data in ("top", "top_all_time"))
 async def show_all_time_top(callback_query: types.CallbackQuery):
