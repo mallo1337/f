@@ -1083,10 +1083,34 @@ def format_lobby_info(lobby_info, players, creator_first_name=None):
             lobby_text += f"{pe('👥')} Игроков в лобби: {players_count}/{max_players}\n{pe('⏳')} Ожидаем еще {max_players - players_count} игроков...\n\n<b>{pe('👥')} Игроки в лобби:</b>\n"
 
         for i, (player_id, player_nickname) in enumerate(players, 1):
-            lobby_text += f"{i}. {display_nickname(player_id, player_nickname)}\n"
+            player_profile = db.get_player_profile(player_id)
+            rating = (player_profile[5] or 0) if player_profile else 0
+            level = get_player_level(rating)
+            game_id = db.get_player_game_id(player_id) or "Не указан"
+            lobby_text += (
+                f"{i}. {level} {display_nickname(player_id, player_nickname)}"
+                f" — ID: <code>{esc(str(game_id))}</code>\n"
+            )
 
         if not players:
             lobby_text += "Пока никто не присоединился\n"
+
+        # После заполнения лобби показываем выбранного случайным образом хоста.
+        if lobby_full:
+            selected_host_id = db.kv_get(f"lobby_host:{lobby_id}")
+            if selected_host_id:
+                try:
+                    selected_host_id = int(selected_host_id)
+                except (TypeError, ValueError):
+                    selected_host_id = None
+                selected_host = next((p for p in players if p[0] == selected_host_id), None)
+                if selected_host:
+                    host_game_id = db.get_player_game_id(selected_host[0]) or "Не указан"
+                    lobby_text += (
+                        f"\n{pe('👑')} Хост матча: "
+                        f"{display_nickname(selected_host[0], selected_host[1])}\n"
+                        f"{pe('🆔')} ID хоста: <code>{esc(str(host_game_id))}</code>\n"
+                    )
 
         return lobby_text, lobby_full
     except Exception as e:
@@ -1828,6 +1852,22 @@ async def perform_lobby_join(user_id, lobby_id, on_joined=None):
         lobby_full = players_count >= max_players
 
         if lobby_full and lobby_info[1]:
+            # Выбираем одного случайного игрока хостом матча и сохраняем выбор,
+            # чтобы всем участникам показывался один и тот же хост.
+            selected_host_id = None
+            if players:
+                existing_host_id = db.kv_get(f"lobby_host:{lobby_id}")
+                try:
+                    existing_host_id = int(existing_host_id) if existing_host_id else None
+                except (TypeError, ValueError):
+                    existing_host_id = None
+                player_ids = {player_id for player_id, _ in players}
+                if existing_host_id in player_ids:
+                    selected_host_id = existing_host_id
+                else:
+                    selected_host_id = random.choice(players)[0]
+                    db.kv_set(f"lobby_host:{lobby_id}", selected_host_id)
+
             db.complete_lobby(lobby_id)
 
             await delete_lobby_channel_message(lobby_id)
@@ -1841,12 +1881,41 @@ async def perform_lobby_join(user_id, lobby_id, on_joined=None):
             await update_lobby_message_for_all_players(lobby_id)
 
             try:
-                notification_text = (
-                    f"{pe('🎉')} Лобби №{lobby_info[1]} заполнено!\n\n"
-                    f"{pe('✅')} Набралось {players_count} игроков\n"
-                    f"{pe('🎮')} Скопируйте id хостера чтобы присоединиться.\n"
-                    f"{pe('📸')} После игры отправьте скриншот с результатами!"
+                notification_lines = [
+                    f"{pe('🎉')} Лобби №{lobby_info[1]} заполнено!",
+                    f"{pe('👥')} Игроков: {players_count}/{max_players}",
+                    "",
+                    f"{pe('🎮')} <b>Состав матча:</b>",
+                ]
+
+                for index, (player_id, player_nickname) in enumerate(players, 1):
+                    player_profile = db.get_player_profile(player_id)
+                    rating = (player_profile[5] or 0) if player_profile else 0
+                    level = get_player_level(rating)
+                    game_id = db.get_player_game_id(player_id) or "Не указан"
+                    notification_lines.append(
+                        f"{index}. {level} {display_nickname(player_id, player_nickname)}"
+                        f" — <code>{esc(str(game_id))}</code>"
+                    )
+
+                selected_host = next(
+                    ((pid, nick) for pid, nick in players if pid == selected_host_id),
+                    None,
                 )
+                notification_lines.append("")
+                if selected_host:
+                    host_game_id = db.get_player_game_id(selected_host[0]) or "Не указан"
+                    notification_lines.extend([
+                        f"{pe('🏆')} <b>Случайный хост матча:</b> {display_nickname(selected_host[0], selected_host[1])}",
+                        f"{pe('🆔')} ID хоста: <code>{esc(str(host_game_id))}</code>",
+                    ])
+                else:
+                    notification_lines.append(f"{pe('⚠️')} Не удалось определить хоста матча.")
+                notification_lines.extend([
+                    "",
+                    f"{pe('📸')} После игры отправьте скриншот с результатами!",
+                ])
+                notification_text = "\n".join(notification_lines)
 
                 for player_id, player_nickname in players:
                     try:
